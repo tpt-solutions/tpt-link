@@ -18,6 +18,9 @@ use socketcan::{CanDataFrame, CanFrame, EmbeddedFrame, Id, Socket, StandardId};
 
 use crate::can::CanBus;
 
+/// Most non-data frames `recv_raw` skips before it returns `None` for this call.
+const MAX_SKIPPED: usize = 256;
+
 /// A SocketCAN interface, such as `vcan0` or `can0`.
 ///
 /// ```no_run
@@ -56,11 +59,20 @@ impl CanBus for SocketCanBus {
         self.socket.write_frame(&frame)
     }
 
+    /// Classic CAN only: this socket is not a CAN FD socket.
+    fn max_data_len(&self) -> usize {
+        crate::can::CLASSIC_MTU
+    }
+
     fn recv_raw(&mut self) -> io::Result<Option<(u16, Vec<u8>)>> {
-        loop {
+        // Foreign traffic is skipped, but only a bounded number of frames per
+        // call, so a busy bus cannot keep one call from returning.
+        for _ in 0..MAX_SKIPPED {
             let frame = match self.socket.read_frame() {
                 Ok(frame) => frame,
                 Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(None),
+                // A signal interrupted the read. Nothing was lost.
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             };
             // Only standard data frames carry link fragments. Remote, error and
@@ -71,5 +83,6 @@ impl CanBus for SocketCanBus {
                 }
             }
         }
+        Ok(None)
     }
 }

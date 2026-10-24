@@ -123,10 +123,18 @@ impl Partial {
 /// Partial messages expire after `timeout_us`, measured from their first
 /// fragment. Call `expire` periodically so that lost fragments do not leak
 /// memory.
+///
+/// Message ids are one byte, so an id comes round again after 256 messages. A
+/// partial message is replaced, and counted in `replaced`, when a fragment
+/// disagrees with it: a different fragment count, or different data for an
+/// index already held. That is how a message that lost a fragment is told
+/// apart from the new message that reuses its id.
 #[derive(Debug)]
 pub struct Reassembler {
     timeout_us: u64,
     pending: HashMap<u8, Partial>,
+    replaced: u64,
+    expired: u64,
 }
 
 impl Reassembler {
@@ -135,7 +143,20 @@ impl Reassembler {
         Self {
             timeout_us,
             pending: HashMap::new(),
+            replaced: 0,
+            expired: 0,
         }
+    }
+
+    /// Partial messages thrown away because a conflicting fragment showed that
+    /// their id had been reused.
+    pub fn replaced(&self) -> u64 {
+        self.replaced
+    }
+
+    /// Partial messages dropped by `expire` over the reassembler's lifetime.
+    pub fn expired(&self) -> u64 {
+        self.expired
     }
 
     /// Accepts one fragment. Returns the whole message when this fragment
@@ -155,12 +176,19 @@ impl Reassembler {
             .pending
             .entry(msg_id)
             .or_insert_with(|| Partial::new(count, now_us));
-        // The id was reused by a different message, so start again.
-        if entry.count != count {
+        // The id was reused by a different message, so start again. A repeat of
+        // a held index with identical data is a plain duplicate and is ignored.
+        let data = &fragment[HEADER_LEN..];
+        let conflicts = entry.count != count
+            || entry.parts[index]
+                .as_deref()
+                .is_some_and(|held| held != data);
+        if conflicts {
             *entry = Partial::new(count, now_us);
+            self.replaced += 1;
         }
         if entry.parts[index].is_none() {
-            entry.parts[index] = Some(fragment[HEADER_LEN..].to_vec());
+            entry.parts[index] = Some(data.to_vec());
             entry.received += 1;
         }
         if entry.received < entry.count {
@@ -197,7 +225,9 @@ impl Reassembler {
         let timeout = self.timeout_us;
         self.pending
             .retain(|_, p| now_us.saturating_sub(p.started_us) <= timeout);
-        before - self.pending.len()
+        let dropped = before - self.pending.len();
+        self.expired += dropped as u64;
+        dropped
     }
 
     /// Number of messages still waiting for fragments.
@@ -264,6 +294,34 @@ mod tests {
         assert_eq!(rx.pending(), 1);
         assert_eq!(rx.expire(u64::MAX), 1);
         assert_eq!(rx.pending(), 0);
+    }
+
+    #[test]
+    fn reused_id_does_not_splice_with_a_stale_partial() {
+        // The first message loses its last fragment, then the id comes round
+        // again for a message with the same fragment count.
+        let old = split(4, b"old message data", 8).unwrap();
+        let new = split(4, b"NEW MESSAGE DATA", 8).unwrap();
+        assert_eq!(old.len(), new.len());
+        let mut rx = Reassembler::new(1_000_000);
+        for frame in &old[..old.len() - 1] {
+            assert_eq!(rx.push(0, frame).unwrap(), None);
+        }
+        let mut out = None;
+        for frame in &new {
+            out = rx.push(1, frame).unwrap().or(out);
+        }
+        assert_eq!(out.as_deref(), Some(&b"NEW MESSAGE DATA"[..]));
+        assert_eq!(rx.replaced(), 1);
+    }
+
+    #[test]
+    fn expiry_is_counted() {
+        let frames = split(5, b"0123456789", 8).unwrap();
+        let mut rx = Reassembler::new(10);
+        rx.push(0, &frames[0]).unwrap();
+        rx.expire(100);
+        assert_eq!(rx.expired(), 1);
     }
 
     #[test]

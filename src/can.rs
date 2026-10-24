@@ -41,6 +41,13 @@ pub trait CanBus {
     /// Error type returned by the bus.
     type Error: std::error::Error + 'static;
 
+    /// Most data bytes one frame on this bus can carry. `CanTransport::new`
+    /// rejects an MTU above it. The default is CAN FD; a bus that carries only
+    /// classic frames should return `CLASSIC_MTU`.
+    fn max_data_len(&self) -> usize {
+        FD_MTU
+    }
+
     /// Sends one data frame with the 11-bit identifier `id`.
     fn send_raw(&mut self, id: u16, data: &[u8]) -> Result<(), Self::Error>;
 
@@ -59,6 +66,14 @@ pub enum CanError<E> {
     Fragment(FragmentError),
     /// The node id does not fit in the identifier.
     InvalidNode(u8),
+    /// The MTU is larger than a frame on this bus can carry, for example the
+    /// FD size on a classic-only bus.
+    MtuTooLarge {
+        /// MTU that was asked for.
+        mtu: usize,
+        /// Largest data length the bus carries.
+        max: usize,
+    },
 }
 
 impl<E: fmt::Display> fmt::Display for CanError<E> {
@@ -67,6 +82,9 @@ impl<E: fmt::Display> fmt::Display for CanError<E> {
             Self::Bus(e) => write!(f, "bus: {e}"),
             Self::Fragment(e) => write!(f, "fragment: {e}"),
             Self::InvalidNode(n) => write!(f, "node {n} is above {MAX_NODE}"),
+            Self::MtuTooLarge { mtu, max } => {
+                write!(f, "MTU {mtu} is above the {max} bytes this bus carries")
+            }
         }
     }
 }
@@ -76,7 +94,7 @@ impl<E: std::error::Error + 'static> std::error::Error for CanError<E> {
         match self {
             Self::Bus(e) => Some(e),
             Self::Fragment(e) => Some(e),
-            Self::InvalidNode(_) => None,
+            Self::InvalidNode(_) | Self::MtuTooLarge { .. } => None,
         }
     }
 }
@@ -115,6 +133,16 @@ impl<B: CanBus> CanTransport<B> {
         if node > MAX_NODE {
             return Err(CanError::InvalidNode(node));
         }
+        // Fail here rather than on the first send.
+        if mtu <= crate::fragment::HEADER_LEN {
+            return Err(CanError::Fragment(FragmentError::InvalidMtu(mtu)));
+        }
+        if mtu > bus.max_data_len() {
+            return Err(CanError::MtuTooLarge {
+                mtu,
+                max: bus.max_data_len(),
+            });
+        }
         Ok(Self {
             bus,
             node,
@@ -134,7 +162,9 @@ impl<B: CanBus> CanTransport<B> {
             reassembler.expire(now_us);
         }
         while let Some((id, data)) = self.bus.recv_raw().map_err(CanError::Bus)? {
-            let sender = (id >> 8) as u8;
+            // Only the low 11 bits are an identifier; mask so a bus that returns
+            // more cannot create extra senders.
+            let sender = ((id >> 8) & 0x7) as u8;
             if sender == self.node {
                 continue;
             }
@@ -156,6 +186,16 @@ impl<B: CanBus> CanTransport<B> {
     /// Fragments that were malformed and dropped.
     pub fn bad_fragments(&self) -> u64 {
         self.bad_fragments
+    }
+
+    /// Partial messages replaced because their id was reused, across all senders.
+    pub fn replaced_partials(&self) -> u64 {
+        self.rx.values().map(Reassembler::replaced).sum()
+    }
+
+    /// Partial messages dropped by timeout, across all senders.
+    pub fn expired_partials(&self) -> u64 {
+        self.rx.values().map(Reassembler::expired).sum()
     }
 
     /// Partial messages still waiting for fragments, across all senders.
@@ -220,7 +260,7 @@ impl VirtualBus {
 
     /// Attaches a new node. Frames sent after this point reach it.
     pub fn attach(&self) -> VirtualNode {
-        let mut state = self.state.lock().expect("bus lock");
+        let mut state = self.lock();
         let index = state.queues.len();
         state.queues.push(VecDeque::new());
         VirtualNode {
@@ -229,9 +269,18 @@ impl VirtualBus {
         }
     }
 
+    /// Locks the shared state. A panic in another thread must not take the
+    /// whole bus down, and the state stays consistent after any single push or
+    /// pop, so a poisoned lock is used as it is.
+    fn lock(&self) -> std::sync::MutexGuard<'_, BusState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Silently drops the next `count` frames sent on the bus.
     pub fn drop_next(&self, count: usize) {
-        self.state.lock().expect("bus lock").drop_next += count;
+        self.lock().drop_next += count;
     }
 }
 
@@ -245,7 +294,7 @@ impl CanBus for VirtualNode {
     type Error = Infallible;
 
     fn send_raw(&mut self, id: u16, data: &[u8]) -> Result<(), Infallible> {
-        let mut state = self.bus.state.lock().expect("bus lock");
+        let mut state = self.bus.lock();
         if state.drop_next > 0 {
             state.drop_next -= 1;
             return Ok(());
@@ -259,7 +308,7 @@ impl CanBus for VirtualNode {
     }
 
     fn recv_raw(&mut self) -> Result<Option<(u16, Vec<u8>)>, Infallible> {
-        let mut state = self.bus.state.lock().expect("bus lock");
+        let mut state = self.bus.lock();
         Ok(state.queues[self.index].pop_front())
     }
 }
@@ -416,6 +465,51 @@ mod tests {
         let bus = VirtualBus::new();
         let result = CanTransport::new(bus.attach(), 8, CLASSIC_MTU, TIMEOUT_US);
         assert!(matches!(result, Err(CanError::InvalidNode(8))));
+    }
+
+    #[test]
+    fn mtu_above_what_the_bus_carries_is_rejected() {
+        struct Classic(Script);
+        impl CanBus for Classic {
+            type Error = Infallible;
+            fn max_data_len(&self) -> usize {
+                CLASSIC_MTU
+            }
+            fn send_raw(&mut self, id: u16, data: &[u8]) -> Result<(), Infallible> {
+                self.0.send_raw(id, data)
+            }
+            fn recv_raw(&mut self) -> Result<Option<(u16, Vec<u8>)>, Infallible> {
+                self.0.recv_raw()
+            }
+        }
+        let result = CanTransport::new(Classic(Script(VecDeque::new())), 0, FD_MTU, TIMEOUT_US);
+        assert!(matches!(
+            result,
+            Err(CanError::MtuTooLarge { mtu: 64, max: 8 })
+        ));
+    }
+
+    #[test]
+    fn mtu_without_room_for_data_is_rejected_at_construction() {
+        let bus = VirtualBus::new();
+        let result = CanTransport::new(bus.attach(), 0, 3, TIMEOUT_US);
+        assert!(matches!(
+            result,
+            Err(CanError::Fragment(FragmentError::InvalidMtu(3)))
+        ));
+    }
+
+    #[test]
+    fn identifier_bits_above_the_node_field_do_not_make_new_senders() {
+        // 0x805 and 0x005 are the same sender once masked to 11 bits.
+        let wire = link_frame(1, b"split across several fragments");
+        let parts = fragments(1, 0, &wire, CLASSIC_MTU);
+        let mut frames = Vec::new();
+        for (i, (id, data)) in parts.into_iter().enumerate() {
+            frames.push((if i % 2 == 0 { id } else { id | 0x800 }, data));
+        }
+        let mut rx = receiver(frames);
+        assert_eq!(rx.try_recv_at(0).unwrap(), Some(wire));
     }
 
     #[test]
