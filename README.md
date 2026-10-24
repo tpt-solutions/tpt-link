@@ -39,6 +39,7 @@ Each runs with no hardware: `cargo run --example <name>`.
 | `heartbeat_monitor` | Declaring a silent peer dead, with injected time |
 | `can_fragment` | A 600-byte frame over classic CAN, on a virtual bus |
 | `session` | Typed messages, automatic heartbeats and liveness (`envelope::Session`) |
+| `reliable_link` | Exactly-once delivery over a link losing 30 % of frames (`reliable::Channel`) |
 | `reconnect` | `Reconnector` and `Heartbeat` keeping a UDP link up |
 | `schema_roundtrip` | A protobuf `Ack` inside a frame (`--features proto`) |
 
