@@ -25,7 +25,7 @@ can-socketcan = ["std", "dep:socketcan"]
 # Protobuf core messages (proto/tpt_link.proto), generated with micropb. micropb is MIT OR Apache-2.0.
 proto = ["dep:micropb"]
 # Authenticated, encrypted frames for links carried in the open (UDP, CAN). hmac, sha2 and chacha20poly1305 are MIT OR Apache-2.0 (RustCrypto).
-auth = ["std", "dep:hmac", "dep:sha2", "dep:chacha20poly1305", "dep:getrandom", "dep:x25519-dalek", "dep:hkdf"]
+auth = ["std", "dep:hmac", "dep:sha2", "dep:chacha20poly1305", "dep:getrandom", "dep:x25519-dalek", "dep:hkdf", "dep:zeroize"]
 
 [dependencies]
 serial2 = { version = "0.2.38", optional = true }
@@ -33,6 +33,7 @@ micropb = { version = "0.6", optional = true }
 hmac = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }
 getrandom = { version = "0.2", optional = true }
+zeroize = { version = "1", optional = true }
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"], optional = true }
 hkdf = { version = "0.12", optional = true }
 chacha20poly1305 = { version = "0.10", optional = true }

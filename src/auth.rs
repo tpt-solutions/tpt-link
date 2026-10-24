@@ -58,6 +58,7 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroize;
 
 use crate::frame::{HEADER_LEN, VERSION};
 use crate::seqwin::{Arrival, SeqWindow};
@@ -118,6 +119,28 @@ impl fmt::Debug for Key {
     }
 }
 
+impl Drop for Key {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+/// A 32-byte secret, wiped when it is dropped. `Debug` output hides the bytes.
+#[derive(Clone)]
+struct Secret([u8; KEY_LEN]);
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Secret(..)")
+    }
+}
+
 /// Why a key operation was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyError {
@@ -144,9 +167,9 @@ impl std::error::Error for KeyError {}
 #[derive(Debug)]
 struct Issued {
     nonce: [u8; NONCE_LEN],
-    /// Our ephemeral secret for this session. Kept as bytes, so the session can
-    /// be answered again.
-    secret: [u8; KEY_LEN],
+    /// Our ephemeral secret for this session, so the session can be answered
+    /// again.
+    secret: Secret,
     key: Key,
     /// The pre-shared key id the session was set up with.
     psk_id: u8,
@@ -190,7 +213,7 @@ pub struct Authenticated<T> {
     /// Id of the pre-shared key that new sessions are set up with.
     active: u8,
     /// Our ephemeral secret for the hello in progress, if any.
-    ephemeral: Option<[u8; KEY_LEN]>,
+    ephemeral: Option<Secret>,
     /// The session we send under, once the receiver has challenged us.
     peer_session: Option<PeerSession>,
     /// The session we receive under, once we have challenged the peer.
@@ -462,7 +485,10 @@ impl<T: Transport> Authenticated<T> {
     /// Sends a hello with this side's ephemeral public key. The same ephemeral
     /// key is reused for retries, so a repeated hello gets the same answer.
     fn send_hello(&mut self) -> Result<(), T::Error> {
-        let secret = *self.ephemeral.get_or_insert_with(random_bytes);
+        let secret = self
+            .ephemeral
+            .get_or_insert_with(|| Secret(random_bytes()))
+            .0;
         let ours = public_of(&secret);
         let (id, psk) = self.active_key();
         let mut wire = vec![TYPE_HELLO, id];
@@ -535,14 +561,14 @@ impl<T: Transport> Authenticated<T> {
         }
 
         let (nonce, secret, window) = match &self.issued {
-            Some(issued) if !issued.in_use => (issued.nonce, issued.secret, issued.window),
-            _ => (random_bytes(), random_bytes(), SeqWindow::default()),
+            Some(issued) if !issued.in_use => (issued.nonce, issued.secret.clone(), issued.window),
+            _ => (random_bytes(), Secret(random_bytes()), SeqWindow::default()),
         };
-        let Some(shared) = shared_secret(&secret, &theirs) else {
+        let Some(shared) = shared_secret(&secret.0, &theirs) else {
             self.rejected += 1;
             return Ok(());
         };
-        let ours = public_of(&secret);
+        let ours = public_of(&secret.0);
         let key = session_key(&psk, &shared, &nonce, &theirs, &ours);
         self.issued = Some(Issued {
             nonce,
@@ -591,7 +617,7 @@ impl<T: Transport> Authenticated<T> {
             &[&[TYPE_CHALLENGE], &[id], &nonce, &theirs, &echo],
             tag,
         );
-        let Some(secret) = self.ephemeral else {
+        let Some(secret) = self.ephemeral.as_ref().map(|s| s.0) else {
             // No hello is outstanding, so this challenge answers nothing.
             self.rejected += 1;
             return Ok(());
