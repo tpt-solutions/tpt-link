@@ -31,7 +31,7 @@ Legend: [x] done, [ ] to do. Section numbers refer to spec.txt.
 - [x] CI: cargo deny check licenses bans sources advisories (passes locally)
 - [x] CI: no_std build for thumbv7em-none-eabihf and riscv32imc-unknown-none-elf
 - [x] CI: doc tests + `cargo doc` with warnings denied
-- [ ] Branch protection / required checks
+- [ ] Branch protection / required checks (GitHub settings; not changed from here)
 
 ## C. Deframer timeout (spec 4, 13.4)
 - [x] Decide design: time injected per P4 (`push_at(bytes, now_us)`, `next_frame_at(now_us)`), configurable `timeout_us` via `with_timeout`
@@ -66,7 +66,7 @@ Legend: [x] done, [ ] to do. Section numbers refer to spec.txt.
 ## F. Release
 - [x] Update spec status (partly implemented -> current) and version (0.2.0)
 - [x] CHANGELOG.md
-- [ ] Tag v0.2.0 (annotated tag, pushed with master)
+- [ ] Tag v0.2.0 (annotated tag, pushed with master). Waiting for the user: tagging and pushing is outward-facing
 
 ## G. Bug fixes from the review (add a regression test for each)
 - [x] Link::poll keeps payloads already received when the transport then errors; the error is reported on the next poll (src/link.rs). Tested in tests/loopback.rs
@@ -85,22 +85,22 @@ Legend: [x] done, [ ] to do. Section numbers refer to spec.txt.
 - [x] Message envelope with a type tag (Data, Heartbeat, Ack, Error) and `Session` with automatic heartbeats (src/envelope.rs). Optional layer, wire format unchanged. Still open: reconcile its Ack/Error bodies with the protobuf schema messages (spec 13.1)
 - [x] Opt-in reliability layer: reliable::Channel (ids, acks, retransmit, exactly-once delivery). Not ordered, no congestion control, no persistence across restarts. Still open: ordered delivery mode
 - [x] Opt-in authentication: auth::Authenticated (ChaCha20-Poly1305 sealed frames, HMAC control messages, feature auth). Replay protection via a receiver-issued session nonce. Restart recovery is automatic (resync). Payloads are encrypted with ChaCha20-Poly1305. Session keys come from an authenticated X25519 exchange (ephemeral keys, HKDF). Pre-shared keys are rotated by id. Still open: frames lost at a restart (use reliable::Channel above), an independent security review
-- [ ] Driver helper combining Session + Reconnector (what examples/reconnect.rs does by hand); Session already covers Link + Heartbeat
+- [x] Driver helper combining Session + Reconnector (`supervisor::Supervisor`, src/supervisor.rs; examples/reconnect.rs still does it by hand)
 - [x] Richer FaultyTransport: reorder (with release_held), duplicate, truncate, version corruption, seeded random loss. Still open: latency and jitter
 - [ ] tokio adapter feature; tracing or defmt feature
 - [x] tpt-link-cli: encode, decode and crc, offline (src/bin/tpt-link-cli.rs). Still open: listen on UDP/serial/CAN, send, bridge, record/replay
 - [ ] Wireshark Lua dissector for the frame format
 - [x] Randomised robustness tests (tests/robustness.rs): decode invariants, noisy-stream recovery, lost-fragment splices over CAN. Still open: cargo-fuzz targets and proptest round trips (needs a nightly toolchain or new dependencies)
-- [ ] Golden test vectors file (testdata/vectors.json); C header or Python binding
+- [ ] Golden test vectors file: done as testdata/vectors.json (tests/vectors.rs, generated with Python zlib). Still open: C header or Python binding
 
 ## I. Adoption
 - [x] Examples: loopback_hello, udp_echo, can_fragment, heartbeat_monitor, fault_injection, schema_roundtrip (all run without hardware)
-- [ ] Examples still to write: serial_bridge (needs a port), no_std MCU
+- [ ] Examples still to write: serial_bridge (needs a port), no_std MCU (not started; both need hardware or a cross target to verify)
 - [ ] cargo-generate templates: host app, Cortex-M node, CAN gateway
 - [x] README: quickstart, git dependency snippet, example, transport and feature tables, MSRV, troubleshooting. Still open: badges (needs the pushed repo and tag)
-- [ ] docs/wire-format.md with byte diagrams; include README in lib.rs docs
-- [ ] Cargo.toml metadata (repository, readme, keywords, categories); decide crates.io vs git dependency
-- [ ] CONTRIBUTING, SECURITY, issue and PR templates, CODEOWNERS, .gitattributes, .editorconfig; clean .gitignore; Keep a Changelog format
+- [ ] docs/wire-format.md with byte diagrams: done. Still open: include README in lib.rs docs
+- [x] Cargo.toml metadata (repository, readme, keywords, categories). Decision: stay on git dependency (publish = false)
+- [ ] CONTRIBUTING, SECURITY, issue and PR templates, .gitattributes, .editorconfig, clean .gitignore: done. Still open: CODEOWNERS (needs the owners' GitHub handles), and tidy the CHANGELOG headings to Keep a Changelog form
 
 ## J. CI and automation
 - [x] ci.yml: concurrency, permissions: contents: read, push branch filter, rust-cache, job timeouts. Still open: SHA-pinned actions (tags used; SHAs could not be looked up offline)
