@@ -25,6 +25,9 @@ pub struct LinkStats {
     pub malformed: u64,
     /// Frames the peer sent that never arrived, found from sequence gaps.
     pub lost: u64,
+    /// Valid frames dropped because the same sequence number had already
+    /// arrived. They are not delivered again.
+    pub duplicates: u64,
 }
 
 /// Errors from `Link::send` and `Link::poll`.
@@ -57,7 +60,10 @@ impl<E: std::error::Error + 'static> std::error::Error for LinkError<E> {
 /// A framed, sequenced link over a transport.
 ///
 /// Damaged frames are counted and dropped, and they never reach the caller.
-/// Gaps in the sequence numbers are counted as lost frames.
+/// Gaps in the sequence numbers are counted as lost frames. A frame that
+/// repeats a sequence number already seen is dropped and counted as a duplicate.
+/// A frame that arrives late, after a higher number, is delivered and fills in
+/// its earlier gap as long as it is within the last 64 sequence numbers.
 ///
 /// Loss is only detectable after the first frame has been received. The
 /// receiver has no expected sequence number until then, so frames lost before
@@ -76,14 +82,18 @@ impl<E: std::error::Error + 'static> std::error::Error for LinkError<E> {
 pub struct Link<T: Transport> {
     transport: T,
     next_seq: u32,
-    expected_seq: Option<u32>,
+    /// Highest sequence number received so far.
+    highest: Option<u32>,
+    /// Bit `n` is set when `highest - n` has arrived. One bit per number in the
+    /// window, so the window is `u64::BITS` wide.
+    seen: u64,
     pending_error: Option<T::Error>,
     stats: LinkStats,
 }
 
-/// How far back a sequence number may step and still count as a reordered or
-/// duplicate frame rather than a peer restart.
-const REORDER_WINDOW: u32 = 64;
+/// How far behind the highest sequence number a frame may arrive and still be
+/// checked against the window. Anything further back is a peer restart.
+const WINDOW: u32 = u64::BITS;
 
 impl<T: Transport> Link<T> {
     /// Wraps a transport.
@@ -91,7 +101,8 @@ impl<T: Transport> Link<T> {
         Self {
             transport,
             next_seq: 0,
-            expected_seq: None,
+            highest: None,
+            seen: 0,
             pending_error: None,
             stats: LinkStats::default(),
         }
@@ -162,9 +173,12 @@ impl<T: Transport> Link<T> {
             while !rest.is_empty() {
                 match frame::decode(rest) {
                     Ok((decoded, used)) => {
-                        self.note_sequence(decoded.seq);
-                        self.stats.received += 1;
-                        payloads.push(decoded.payload.to_vec());
+                        if self.note_sequence(decoded.seq) {
+                            self.stats.received += 1;
+                            payloads.push(decoded.payload.to_vec());
+                        } else {
+                            self.stats.duplicates += 1;
+                        }
                         rest = &rest[used..];
                     }
                     Err(FrameError::BadCrc { .. }) => {
@@ -203,25 +217,50 @@ impl<T: Transport> Link<T> {
         self.transport
     }
 
-    fn note_sequence(&mut self, seq: u32) {
-        if let Some(expected) = self.expected_seq {
-            // A forward gap counts as loss. A small backward step (a duplicate
-            // or a reordered frame) is ignored and does not move the expected
-            // number, so the frames after it are not counted as lost. A large
-            // backward jump is taken as a peer restart and resyncs. The
-            // threshold is half the sequence space, so wraparound is handled.
-            let gap = seq.wrapping_sub(expected);
-            if gap == 0 {
-                self.expected_seq = Some(seq.wrapping_add(1));
-            } else if gap < 0x8000_0000 {
-                self.stats.lost += u64::from(gap);
-                self.expected_seq = Some(seq.wrapping_add(1));
-            } else if expected.wrapping_sub(seq) > REORDER_WINDOW {
-                self.expected_seq = Some(seq.wrapping_add(1));
-            }
-        } else {
-            self.expected_seq = Some(seq.wrapping_add(1));
+    /// Records an arriving sequence number. Returns `true` if the frame is new
+    /// and should be delivered, and `false` for a duplicate.
+    fn note_sequence(&mut self, seq: u32) -> bool {
+        let Some(highest) = self.highest else {
+            self.highest = Some(seq);
+            self.seen = 1;
+            return true;
+        };
+
+        // Distances wrap, and the half of the sequence space above zero counts
+        // as ahead. This keeps wraparound working.
+        let ahead = seq.wrapping_sub(highest);
+        if ahead == 0 {
+            return false;
         }
+        if ahead < 0x8000_0000 {
+            // The numbers between the old highest and this one are missing so
+            // far. A late arrival may still fill them in.
+            self.stats.lost += u64::from(ahead - 1);
+            self.seen = if ahead >= WINDOW {
+                0
+            } else {
+                self.seen << ahead
+            };
+            self.seen |= 1;
+            self.highest = Some(seq);
+            return true;
+        }
+
+        let behind = highest.wrapping_sub(seq);
+        if behind >= WINDOW {
+            // Too far back to be a late frame, so the peer has restarted.
+            self.seen = 1;
+            self.highest = Some(seq);
+            return true;
+        }
+        let bit = 1u64 << behind;
+        if self.seen & bit != 0 {
+            return false;
+        }
+        // A late frame that fills an earlier gap. It was already counted as
+        // lost, and it is not taken back out.
+        self.seen |= bit;
+        true
     }
 }
 

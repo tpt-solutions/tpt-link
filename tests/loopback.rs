@@ -191,3 +191,49 @@ fn unknown_version_is_counted_separately_from_crc_errors() {
     assert_eq!(b.stats().bad_version, 1);
     assert_eq!(b.stats().crc_errors, 0);
 }
+
+#[test]
+fn duplicate_frame_is_dropped_and_counted() {
+    use tpt_link::Transport;
+
+    let (mut a, b) = Loopback::pair();
+    let mut b = Link::new(b);
+    for seq in [0, 1, 1, 2] {
+        a.send(&raw_frame(seq, b"x")).unwrap();
+    }
+
+    assert_eq!(b.poll().unwrap().len(), 3);
+    assert_eq!(b.stats().duplicates, 1);
+    assert_eq!(b.stats().lost, 0);
+}
+
+#[test]
+fn late_frame_fills_its_gap_and_its_repeat_is_dropped() {
+    use tpt_link::Transport;
+
+    let (mut a, b) = Loopback::pair();
+    let mut b = Link::new(b);
+    for seq in [0, 2, 1, 1] {
+        a.send(&raw_frame(seq, &[seq as u8])).unwrap();
+    }
+
+    let got = b.poll().unwrap();
+    assert_eq!(got, vec![vec![0], vec![2], vec![1]]);
+    assert_eq!(b.stats().duplicates, 1);
+    assert_eq!(b.stats().lost, 1);
+}
+
+#[test]
+fn frame_older_than_the_window_is_taken_as_a_restart() {
+    use tpt_link::Transport;
+
+    let (mut a, b) = Loopback::pair();
+    let mut b = Link::new(b);
+    for seq in [0, 200, 0] {
+        a.send(&raw_frame(seq, b"x")).unwrap();
+    }
+
+    assert_eq!(b.poll().unwrap().len(), 3);
+    assert_eq!(b.stats().lost, 199);
+    assert_eq!(b.stats().duplicates, 0);
+}
