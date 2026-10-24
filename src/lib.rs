@@ -43,6 +43,8 @@ pub mod serial;
 #[cfg(feature = "std")]
 pub mod stream;
 #[cfg(feature = "std")]
+pub mod supervisor;
+#[cfg(feature = "std")]
 pub mod transport;
 #[cfg(feature = "std")]
 pub mod udp;
