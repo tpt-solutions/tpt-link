@@ -31,6 +31,8 @@ pub mod link;
 #[cfg(feature = "std")]
 pub mod reconnect;
 #[cfg(feature = "std")]
+pub mod reliable;
+#[cfg(feature = "std")]
 mod rng;
 #[cfg(feature = "std")]
 mod seqwin;

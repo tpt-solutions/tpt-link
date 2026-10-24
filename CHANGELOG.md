@@ -38,7 +38,15 @@ changes bump the minor version.
 - `UdpTransport` no longer returns Windows `ConnectionReset` from `try_recv`.
 - `VirtualBus` no longer panics on a poisoned lock.
 
+### Changed (breaking)
+- `envelope::Message` has a new `Reliable { id, data }` variant (type byte 4).
+  Exhaustive matches need an arm for it.
+
 ### Added
+- `reliable::Channel`: acknowledged delivery over a `Transport`. Each message gets an
+  id, every copy is acknowledged, and unacknowledged messages are sent again after
+  `retransmit_us`. The caller receives each message once. Delivery is exactly-once,
+  but not in send order. Window of at most 64. Example: `reliable_link`.
 - `tpt-link-cli`: `encode`, `decode` and `crc` for frames, offline. Needs the std feature.
 - Randomised robustness tests (tests/robustness.rs), fixed seed.
 - `Reconnector::with_max_attempts`, `gave_up`, `restart` and `with_backoff`. `Backoff::with_jitter` shortens waits by a seeded random share.
