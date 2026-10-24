@@ -7,27 +7,32 @@
 //! The link CRC catches damage, but anyone who can reach the port or the bus
 //! can compute it, so it cannot tell a real frame from a forged one.
 //! `Authenticated` wraps a transport and seals every frame with
-//! ChaCha20-Poly1305. Control messages (hello, challenge and resync) carry a
-//! 16-byte HMAC-SHA256 tag instead, since they hide nothing.
+//! ChaCha20-Poly1305, under a session key that the two ends agree on
+//! automatically.
 //!
-//! Keys are identified by a one-byte id, which every message carries. The
-//! sender seals with its active key. The receiver accepts any installed key.
+//! Each side holds pre-shared keys, identified by a one-byte id that every
+//! message carries. The pre-shared key authenticates the handshake, and it also
+//! feeds the session key derivation. Control messages (hello, challenge and
+//! resync) carry an HMAC-SHA256 tag under the pre-shared key.
 //!
-//! Replay is stopped by a session nonce, which the receiver chooses:
+//! Each session is set up like this:
 //!
-//! 1. A sender with no session sends a signed *hello*, and queues its frames.
-//! 2. The receiver answers with a signed *challenge* holding a fresh random
-//!    nonce, and accepts data only under that nonce.
-//! 3. The session nonce is bound into every sealed frame as associated data.
-//!    A frame recorded in an earlier session fails once the receiver has
-//!    issued a new nonce.
+//! 1. A sender with no session sends a signed *hello* with a fresh X25519
+//!    public key, and queues its frames.
+//! 2. The receiver answers with a signed *challenge*. It holds a fresh random
+//!    nonce and its own X25519 public key, and it echoes the sender's public key
+//!    so the sender can match the challenge to its hello.
+//! 3. Both ends compute the same session key, from the X25519 shared secret,
+//!    the pre-shared key, the nonce and both public keys. Data is sealed under
+//!    the session key, with the nonce bound in as associated data.
 //! 4. Within a session, the sequence window refuses repeats, and refuses
 //!    numbers too far back to check, rather than treating them as a restart.
 //!
 //! What this gives: every frame that reaches the link was made by a holder of
-//! an installed key, for the session the receiver is in, and was not altered.
-//! A replay from an earlier session or from far back in this one is refused.
-//! Payloads are encrypted, so a listener cannot read them.
+//! the session key, and was not altered. A replay from an earlier session or
+//! from far back in this one is refused. Payloads are encrypted, so a listener
+//! cannot read them. Session keys come from fresh ephemeral keys, so an earlier
+//! session stays secret even if the pre-shared key leaks later.
 //!
 //! What it does not give:
 //!
@@ -39,9 +44,9 @@
 //! - **Hello flooding protection.** A replayed hello makes the receiver issue a
 //!   new nonce, which ends the current session. That is denial of service, not
 //!   a way to inject frames.
-//! - **Automatic key exchange.** Keys are shared out of band. Rotation is done
-//!   by the application: install the new key on both ends, activate it on both,
-//!   then retire the old key. See `install_key`.
+//! - **Pre-shared key distribution.** The pre-shared keys are shared out of
+//!   band. Rotating them is done by the application: install the new key on both
+//!   ends, activate it on both, then retire the old key. See `install_key`.
 //! - **Traffic analysis.** Frame sizes and timing are visible.
 
 use std::collections::VecDeque;
@@ -49,8 +54,10 @@ use std::fmt;
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::frame::{HEADER_LEN, VERSION};
 use crate::seqwin::{Arrival, SeqWindow};
@@ -58,16 +65,18 @@ use crate::transport::Transport;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Bytes in a shared key.
+/// Bytes in a pre-shared key, and in a session key.
 pub const KEY_LEN: usize = 32;
-/// Bytes of tag on each control message, and on each sealed frame.
+/// Bytes of tag on each control message.
 pub const TAG_LEN: usize = 16;
 /// Bytes in a session nonce.
 pub const NONCE_LEN: usize = 16;
+/// Bytes in an X25519 public key.
+const PUBLIC_LEN: usize = 32;
 /// Bytes in the random nonce sent with each data message.
 const MESSAGE_NONCE_LEN: usize = 12;
-/// Most keys a receiver accepts at once. Two overlap a rotation. The rest is
-/// headroom for a slow rollout.
+/// Most pre-shared keys a side holds at once. Two overlap a rotation. The rest
+/// is headroom for a slow rollout.
 const MAX_KEYS: usize = 4;
 
 /// First byte of a hello. It is not a frame version, so the two never clash.
@@ -80,6 +89,11 @@ const TYPE_RESYNC: u8 = 0xC2;
 /// First byte of a data message. The frame inside is sealed, so it has no
 /// readable first byte, and this type byte keeps data apart from control.
 const TYPE_DATA: u8 = 0xD0;
+/// Hello: type, key id, sender's public key, tag.
+const HELLO_LEN: usize = 2 + PUBLIC_LEN + TAG_LEN;
+/// Challenge: type, key id, nonce, receiver's public key, echo of the sender's
+/// public key, tag.
+const CHALLENGE_LEN: usize = 2 + NONCE_LEN + 2 * PUBLIC_LEN + TAG_LEN;
 /// Frames held back while the session is being set up. The oldest are dropped
 /// beyond this.
 const MAX_PENDING: usize = 32;
@@ -125,15 +139,30 @@ impl fmt::Display for KeyError {
 
 impl std::error::Error for KeyError {}
 
-/// The nonce this side issued to its peer, and what has arrived under it.
+/// The session this side receives under: the nonce it issued, the key derived
+/// for it, and what has arrived under it.
 #[derive(Debug)]
 struct Issued {
     nonce: [u8; NONCE_LEN],
+    /// Our ephemeral secret for this session. Kept as bytes, so the session can
+    /// be answered again.
+    secret: [u8; KEY_LEN],
+    key: Key,
+    /// The pre-shared key id the session was set up with.
+    psk_id: u8,
     window: SeqWindow,
-    /// True once a frame has been accepted under this nonce. Until then, a
-    /// repeated hello gets the same challenge back, so duplicate hellos from
-    /// a sender that is still setting up do not replace the nonce.
+    /// True once a frame has been accepted under this session. Until then, a
+    /// repeated hello gets the same challenge back, so duplicate hellos from a
+    /// sender that is still setting up do not replace the session.
     in_use: bool,
+}
+
+/// The session this side sends under.
+#[derive(Debug)]
+struct PeerSession {
+    nonce: [u8; NONCE_LEN],
+    key: Key,
+    psk_id: u8,
 }
 
 /// Wraps a transport and authenticates and encrypts every frame.
@@ -143,10 +172,10 @@ struct Issued {
 /// use tpt_link::auth::{Authenticated, KEY_LEN, Key};
 /// use tpt_link::Link;
 ///
-/// let key = Key::new([7; KEY_LEN]);
+/// let psk = Key::new([7; KEY_LEN]);
 /// let (a, b) = Loopback::pair();
-/// let mut tx = Link::new(Authenticated::new(a, key.clone()));
-/// let mut rx = Link::new(Authenticated::new(b, key));
+/// let mut tx = Link::new(Authenticated::new(a, psk.clone()));
+/// let mut rx = Link::new(Authenticated::new(b, psk));
 /// tx.send(b"open valve").unwrap();
 /// rx.poll().unwrap(); // the hello is answered here
 /// tx.poll().unwrap(); // the challenge arrives and the queued frame goes out
@@ -155,13 +184,16 @@ struct Issued {
 #[derive(Debug)]
 pub struct Authenticated<T> {
     inner: T,
-    /// Keys this side accepts, by id. The active key is always among them.
+    /// Pre-shared keys this side accepts, by id. The active key is always among
+    /// them.
     keys: Vec<(u8, Key)>,
-    /// Id of the key used to send.
+    /// Id of the pre-shared key that new sessions are set up with.
     active: u8,
-    /// The nonce the peer issued to us. Our frames are sent under it.
-    peer_nonce: Option<[u8; NONCE_LEN]>,
-    /// The nonce we issued to the peer, if any.
+    /// Our ephemeral secret for the hello in progress, if any.
+    ephemeral: Option<[u8; KEY_LEN]>,
+    /// The session we send under, once the receiver has challenged us.
+    peer_session: Option<PeerSession>,
+    /// The session we receive under, once we have challenged the peer.
     issued: Option<Issued>,
     pending: VecDeque<Vec<u8>>,
     polls_since_hello: u32,
@@ -174,14 +206,15 @@ pub struct Authenticated<T> {
 }
 
 impl<T> Authenticated<T> {
-    /// Wraps `inner`, with `key` as key 0 and active. Both ends must hold the
-    /// same key.
-    pub fn new(inner: T, key: Key) -> Self {
+    /// Wraps `inner`, with `psk` as pre-shared key 0 and active. Both ends must
+    /// hold the same key.
+    pub fn new(inner: T, psk: Key) -> Self {
         Self {
             inner,
-            keys: vec![(0, key)],
+            keys: vec![(0, psk)],
             active: 0,
-            peer_nonce: None,
+            ephemeral: None,
+            peer_session: None,
             issued: None,
             pending: VecDeque::new(),
             polls_since_hello: 0,
@@ -192,9 +225,10 @@ impl<T> Authenticated<T> {
         }
     }
 
-    /// Accepts messages made under `key`, identified by `id`. Installing an id
-    /// that is already in use replaces its key. If the number of keys exceeds
-    /// the limit, the oldest one that is not active is dropped.
+    /// Accepts handshakes made under the pre-shared key `key`, identified by
+    /// `id`. Installing an id that is already in use replaces its key. If the
+    /// number of keys exceeds the limit, the oldest one that is not active is
+    /// dropped.
     ///
     /// To rotate: install the new key on both ends, activate it on both ends,
     /// then retire the old key on both ends. Replacing the active key takes
@@ -213,19 +247,22 @@ impl<T> Authenticated<T> {
         }
     }
 
-    /// Makes the key with this id the one used to send. Fails if no such key is
-    /// installed.
+    /// Makes the key with this id the one new sessions are set up with. The
+    /// current session is replaced by one under the new key on the next send.
+    /// Fails if no such key is installed.
     pub fn activate_key(&mut self, id: u8) -> Result<(), KeyError> {
-        if self.key_ref(id).is_some() {
-            self.active = id;
-            Ok(())
-        } else {
-            Err(KeyError::Unknown(id))
+        if self.key_ref(id).is_none() {
+            return Err(KeyError::Unknown(id));
         }
+        if id != self.active {
+            self.active = id;
+            self.start_session();
+        }
+        Ok(())
     }
 
-    /// Stops accepting messages made under the key with this id. The active key
-    /// cannot be retired.
+    /// Stops accepting handshakes under the key with this id, and ends any
+    /// session that was set up with it. The active key cannot be retired.
     pub fn retire_key(&mut self, id: u8) -> Result<(), KeyError> {
         if id == self.active {
             return Err(KeyError::Active(id));
@@ -233,13 +270,18 @@ impl<T> Authenticated<T> {
         let before = self.keys.len();
         self.keys.retain(|(k, _)| *k != id);
         if self.keys.len() == before {
-            Err(KeyError::Unknown(id))
-        } else {
-            Ok(())
+            return Err(KeyError::Unknown(id));
         }
+        if self.issued.as_ref().is_some_and(|i| i.psk_id == id) {
+            self.issued = None;
+        }
+        if self.peer_session.as_ref().is_some_and(|s| s.psk_id == id) {
+            self.peer_session = None;
+        }
+        Ok(())
     }
 
-    /// The id of the key used to send.
+    /// The id of the pre-shared key that new sessions are set up with.
     pub fn active_key_id(&self) -> u8 {
         self.active
     }
@@ -275,13 +317,22 @@ impl<T> Authenticated<T> {
         self.keys.iter().find(|(k, _)| *k == id).map(|(_, key)| key)
     }
 
-    /// The active key and its id. The active key is always installed, because
-    /// `new` installs it, `install_key` never drops it, and `retire_key` refuses it.
+    /// The active pre-shared key and its id. The active key is always installed,
+    /// because `new` installs it, `install_key` never drops it, and `retire_key`
+    /// refuses it.
     fn active_key(&self) -> (u8, &Key) {
         let key = self
             .key_ref(self.active)
             .expect("the active key is always installed");
         (self.active, key)
+    }
+
+    /// Forgets the session in progress, so the next hello uses a fresh
+    /// ephemeral key.
+    fn start_session(&mut self) {
+        self.peer_session = None;
+        self.ephemeral = None;
+        self.polls_since_hello = 0;
     }
 }
 
@@ -307,25 +358,64 @@ fn verify_over(key: &Key, parts: &[&[u8]], tag: &[u8]) -> bool {
     mac.verify_truncated_left(tag).is_ok()
 }
 
-/// A fresh nonce from the operating system. If that source is unavailable, the
-/// session cannot be made safe, so this panics rather than return a weak value.
-fn fresh_nonce() -> [u8; NONCE_LEN] {
-    let mut nonce = [0u8; NONCE_LEN];
-    getrandom::getrandom(&mut nonce).expect("the operating system random source is available");
-    nonce
+/// Fresh random bytes from the operating system. If that source is unavailable,
+/// no session can be made safe, so this panics rather than return a weak value.
+fn random_bytes<const N: usize>() -> [u8; N] {
+    let mut bytes = [0u8; N];
+    getrandom::getrandom(&mut bytes).expect("the operating system random source is available");
+    bytes
+}
+
+/// The public key for an ephemeral secret.
+fn public_of(secret: &[u8; KEY_LEN]) -> [u8; PUBLIC_LEN] {
+    PublicKey::from(&StaticSecret::from(*secret)).to_bytes()
+}
+
+/// The X25519 shared secret of `secret` and `their`. `None` if the result is all
+/// zeros, which happens only when `their` is a low-order point, so the secret
+/// would be known to anyone.
+fn shared_secret(secret: &[u8; KEY_LEN], their: &[u8; PUBLIC_LEN]) -> Option<[u8; KEY_LEN]> {
+    let shared = StaticSecret::from(*secret).diffie_hellman(&PublicKey::from(*their));
+    let bytes = *shared.as_bytes();
+    if bytes == [0u8; KEY_LEN] {
+        None
+    } else {
+        Some(bytes)
+    }
+}
+
+/// The session key for one direction. It depends on the pre-shared key, the
+/// shared secret, the nonce, and both public keys, so each session gets its own
+/// key and both ends derive the same one.
+fn session_key(
+    psk: &Key,
+    shared: &[u8; KEY_LEN],
+    nonce: &[u8; NONCE_LEN],
+    hello_pub: &[u8; PUBLIC_LEN],
+    challenge_pub: &[u8; PUBLIC_LEN],
+) -> Key {
+    let hk = Hkdf::<Sha256>::new(Some(&psk.0), shared);
+    let mut info = Vec::with_capacity(19 + NONCE_LEN + 2 * PUBLIC_LEN);
+    info.extend_from_slice(b"tpt-link session v1");
+    info.extend_from_slice(nonce);
+    info.extend_from_slice(hello_pub);
+    info.extend_from_slice(challenge_pub);
+    let mut okm = [0u8; KEY_LEN];
+    hk.expand(&info, &mut okm)
+        .expect("32 bytes is a valid HKDF output length");
+    Key(okm)
 }
 
 /// A fresh random nonce for one data message. Random 96-bit nonces are safe for
 /// ChaCha20-Poly1305 at the message volumes a link carries.
 fn fresh_message_nonce() -> [u8; MESSAGE_NONCE_LEN] {
-    let mut nonce = [0u8; MESSAGE_NONCE_LEN];
-    getrandom::getrandom(&mut nonce).expect("the operating system random source is available");
-    nonce
+    random_bytes()
 }
 
 /// A data message: its type byte, its key id, a fresh nonce, then the frame
-/// sealed with ChaCha20-Poly1305. The session nonce is bound in as associated
-/// data, so a message sealed in one session does not open in another.
+/// sealed with ChaCha20-Poly1305 under the session key. The session nonce is
+/// bound in as associated data, so a message sealed in one session does not open
+/// in another.
 fn data_wire(key: &Key, id: u8, session: &[u8; NONCE_LEN], frame: &[u8]) -> Vec<u8> {
     let nonce = fresh_message_nonce();
     let cipher = ChaCha20Poly1305::new_from_slice(&key.0).expect("the key is 32 bytes");
@@ -365,27 +455,32 @@ impl<T: Transport> Authenticated<T> {
     /// Starts a new session with the peer. Call this after either side restarts
     /// or reconnects. Frames sent before the peer answers are held in the queue.
     pub fn renew(&mut self) -> Result<(), T::Error> {
-        self.peer_nonce = None;
+        self.start_session();
         self.send_hello()
     }
 
+    /// Sends a hello with this side's ephemeral public key. The same ephemeral
+    /// key is reused for retries, so a repeated hello gets the same answer.
     fn send_hello(&mut self) -> Result<(), T::Error> {
-        let (id, key) = self.active_key();
+        let secret = *self.ephemeral.get_or_insert_with(random_bytes);
+        let ours = public_of(&secret);
+        let (id, psk) = self.active_key();
         let mut wire = vec![TYPE_HELLO, id];
-        wire.extend_from_slice(&tag_over(key, &[&[TYPE_HELLO], &[id]]));
+        wire.extend_from_slice(&ours);
+        wire.extend_from_slice(&tag_over(psk, &[&[TYPE_HELLO], &[id], &ours]));
         self.inner.send(&wire)
     }
 
     /// Tells the sender that there is no session, so it should send a hello.
     fn send_resync(&mut self) -> Result<(), T::Error> {
-        let (id, key) = self.active_key();
+        let (id, psk) = self.active_key();
         let mut wire = vec![TYPE_RESYNC, id];
-        wire.extend_from_slice(&tag_over(key, &[&[TYPE_RESYNC], &[id]]));
+        wire.extend_from_slice(&tag_over(psk, &[&[TYPE_RESYNC], &[id]]));
         self.inner.send(&wire)
     }
 
-    /// The peer has no session with us. Forget its nonce, and say hello so that
-    /// it issues a new one. Frames that were already queued go out after that.
+    /// The peer has no session with us. Forget our session, and start a new
+    /// one. Frames that were already queued go out once the peer answers.
     fn take_resync(&mut self, wire: &[u8]) -> Result<(), T::Error> {
         if wire.len() != 2 + TAG_LEN {
             self.rejected += 1;
@@ -394,90 +489,127 @@ impl<T: Transport> Authenticated<T> {
         let id = wire[1];
         let valid = self
             .key_ref(id)
-            .is_some_and(|key| verify_over(key, &[&[TYPE_RESYNC], &[id]], &wire[2..]));
+            .is_some_and(|psk| verify_over(psk, &[&[TYPE_RESYNC], &[id]], &wire[2..]));
         if !valid {
             self.rejected += 1;
             return Ok(());
         }
-        self.peer_nonce = None;
-        self.polls_since_hello = 0;
+        self.start_session();
         self.send_hello()
     }
 
-    /// Sends the queued frames, now that the peer's nonce is known.
+    /// Sends the queued frames, now that the peer's session is known.
     fn flush(&mut self) -> Result<(), T::Error> {
-        let Some(nonce) = self.peer_nonce else {
+        let Some(session) = self.peer_session.as_ref() else {
             return Ok(());
         };
         while let Some(frame) = self.pending.pop_front() {
-            let wire = self.seal_for_peer(&nonce, &frame);
+            let wire = data_wire(&session.key, session.psk_id, &session.nonce, &frame);
             self.inner.send(&wire)?;
         }
         Ok(())
     }
 
-    fn seal_for_peer(&self, session: &[u8; NONCE_LEN], frame: &[u8]) -> Vec<u8> {
-        let (id, key) = self.active_key();
-        data_wire(key, id, session, frame)
-    }
-
-    /// Answers a hello with a challenge holding a fresh nonce. The challenge
-    /// uses the key the hello named, so the sender can check it.
+    /// Answers a hello with a challenge. The receiver's ephemeral key is reused
+    /// for a hello that repeats one not yet in use, and the session key is
+    /// derived from the sender's public key in this hello.
     fn answer_hello(&mut self, wire: &[u8]) -> Result<(), T::Error> {
-        if wire.len() != 2 + TAG_LEN {
+        if wire.len() != HELLO_LEN {
             self.rejected += 1;
             return Ok(());
         }
         let id = wire[1];
-        let Some(key) = self.key_ref(id).cloned() else {
+        let mut theirs = [0u8; PUBLIC_LEN];
+        theirs.copy_from_slice(&wire[2..2 + PUBLIC_LEN]);
+        let Some(psk) = self.key_ref(id).cloned() else {
             self.rejected += 1;
             return Ok(());
         };
-        if !verify_over(&key, &[&[TYPE_HELLO], &[id]], &wire[2..]) {
+        if !verify_over(
+            &psk,
+            &[&[TYPE_HELLO], &[id], &theirs],
+            &wire[2 + PUBLIC_LEN..],
+        ) {
             self.rejected += 1;
             return Ok(());
         }
-        let nonce = match &self.issued {
-            Some(issued) if !issued.in_use => issued.nonce,
-            _ => {
-                let nonce = fresh_nonce();
-                self.issued = Some(Issued {
-                    nonce,
-                    window: SeqWindow::default(),
-                    in_use: false,
-                });
-                nonce
-            }
+
+        let (nonce, secret, window) = match &self.issued {
+            Some(issued) if !issued.in_use => (issued.nonce, issued.secret, issued.window),
+            _ => (random_bytes(), random_bytes(), SeqWindow::default()),
         };
+        let Some(shared) = shared_secret(&secret, &theirs) else {
+            self.rejected += 1;
+            return Ok(());
+        };
+        let ours = public_of(&secret);
+        let key = session_key(&psk, &shared, &nonce, &theirs, &ours);
+        self.issued = Some(Issued {
+            nonce,
+            secret,
+            key,
+            psk_id: id,
+            window,
+            in_use: false,
+        });
         self.resync_sent = false;
+
         let mut out = vec![TYPE_CHALLENGE, id];
         out.extend_from_slice(&nonce);
-        out.extend_from_slice(&tag_over(&key, &[&[TYPE_CHALLENGE], &[id], &nonce]));
+        out.extend_from_slice(&ours);
+        out.extend_from_slice(&theirs);
+        out.extend_from_slice(&tag_over(
+            &psk,
+            &[&[TYPE_CHALLENGE], &[id], &nonce, &ours, &theirs],
+        ));
         self.inner.send(&out)
     }
 
-    /// Takes the peer's nonce from a challenge and sends the queued frames.
+    /// Takes a challenge that answers our current hello, derives the session
+    /// key, and sends the queued frames. A challenge that answers an earlier
+    /// hello is refused, because it does not echo our current public key.
     fn take_challenge(&mut self, wire: &[u8]) -> Result<(), T::Error> {
-        if wire.len() != 2 + NONCE_LEN + TAG_LEN {
+        if wire.len() != CHALLENGE_LEN {
             self.rejected += 1;
             return Ok(());
         }
         let id = wire[1];
-        let nonce_bytes = &wire[2..2 + NONCE_LEN];
-        let valid = self.key_ref(id).is_some_and(|key| {
-            verify_over(
-                key,
-                &[&[TYPE_CHALLENGE], &[id], nonce_bytes],
-                &wire[2 + NONCE_LEN..],
-            )
-        });
-        if !valid {
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce.copy_from_slice(&wire[2..2 + NONCE_LEN]);
+        let mut theirs = [0u8; PUBLIC_LEN];
+        theirs.copy_from_slice(&wire[2 + NONCE_LEN..2 + NONCE_LEN + PUBLIC_LEN]);
+        let mut echo = [0u8; PUBLIC_LEN];
+        echo.copy_from_slice(&wire[2 + NONCE_LEN + PUBLIC_LEN..2 + NONCE_LEN + 2 * PUBLIC_LEN]);
+        let tag = &wire[2 + NONCE_LEN + 2 * PUBLIC_LEN..];
+
+        let Some(psk) = self.key_ref(id).cloned() else {
+            self.rejected += 1;
+            return Ok(());
+        };
+        let authentic = verify_over(
+            &psk,
+            &[&[TYPE_CHALLENGE], &[id], &nonce, &theirs, &echo],
+            tag,
+        );
+        let Some(secret) = self.ephemeral else {
+            // No hello is outstanding, so this challenge answers nothing.
+            self.rejected += 1;
+            return Ok(());
+        };
+        if !authentic || public_of(&secret) != echo {
             self.rejected += 1;
             return Ok(());
         }
-        let mut nonce = [0u8; NONCE_LEN];
-        nonce.copy_from_slice(nonce_bytes);
-        self.peer_nonce = Some(nonce);
+        let Some(shared) = shared_secret(&secret, &theirs) else {
+            self.rejected += 1;
+            return Ok(());
+        };
+        let key = session_key(&psk, &shared, &nonce, &echo, &theirs);
+        self.peer_session = Some(PeerSession {
+            nonce,
+            key,
+            psk_id: id,
+        });
         self.polls_since_hello = 0;
         self.flush()
     }
@@ -485,8 +617,8 @@ impl<T: Transport> Authenticated<T> {
     /// Opens a data message and checks it. Returns the frame if it is new and
     /// authentic.
     fn take_data(&mut self, wire: &[u8]) -> Result<Option<Vec<u8>>, T::Error> {
-        let session = match &self.issued {
-            Some(issued) => issued.nonce,
+        let (session, key, psk_id) = match &self.issued {
+            Some(issued) => (issued.nonce, issued.key.clone(), issued.psk_id),
             None => {
                 // No session with this peer. A restart on our side is the usual
                 // reason, so tell the sender to start again.
@@ -498,15 +630,10 @@ impl<T: Transport> Authenticated<T> {
                 return Ok(None);
             }
         };
-        if wire.len() < 2 + MESSAGE_NONCE_LEN + TAG_LEN + HEADER_LEN {
+        if wire.len() < 2 + MESSAGE_NONCE_LEN + TAG_LEN + HEADER_LEN || wire[1] != psk_id {
             self.rejected += 1;
             return Ok(None);
         }
-        let id = wire[1];
-        let Some(key) = self.key_ref(id).cloned() else {
-            self.rejected += 1;
-            return Ok(None);
-        };
         let (nonce, sealed) = wire[2..].split_at(MESSAGE_NONCE_LEN);
         let Some(frame) = open_data(&key, &session, nonce, sealed) else {
             self.rejected += 1;
@@ -537,9 +664,9 @@ impl<T: Transport> Transport for Authenticated<T> {
     type Error = T::Error;
 
     fn send(&mut self, frame: &[u8]) -> Result<(), T::Error> {
-        match self.peer_nonce {
-            Some(nonce) => {
-                let wire = self.seal_for_peer(&nonce, frame);
+        match &self.peer_session {
+            Some(session) => {
+                let wire = data_wire(&session.key, session.psk_id, &session.nonce, frame);
                 self.inner.send(&wire)
             }
             None => {
@@ -558,7 +685,7 @@ impl<T: Transport> Transport for Authenticated<T> {
             let Some(wire) = self.inner.try_recv()? else {
                 // Nothing arrived. If frames are still waiting for a session,
                 // the hello may have been lost, so send it again now and then.
-                if self.peer_nonce.is_none() && !self.pending.is_empty() {
+                if self.peer_session.is_none() && !self.pending.is_empty() {
                     self.polls_since_hello += 1;
                     if self.polls_since_hello >= HELLO_RETRY_POLLS {
                         self.polls_since_hello = 0;
@@ -683,7 +810,7 @@ mod tests {
         deliver(&mut tx, &mut rx, &frame(0, b"open valve"));
         let old = data_wires(&tx.inner_mut().log)[0].clone();
 
-        // A new session: the receiver issues a fresh nonce.
+        // A new session: new ephemeral keys and a fresh nonce.
         tx.renew().unwrap();
         rx.try_recv().unwrap();
         tx.try_recv().unwrap();
@@ -721,10 +848,9 @@ mod tests {
     #[test]
     fn a_hello_naming_an_unknown_key_is_refused() {
         let (mut raw, b) = Loopback::pair();
-        raw.send(&[
-            TYPE_HELLO, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ])
-        .unwrap();
+        let mut hello = vec![TYPE_HELLO, 9];
+        hello.extend([0u8; PUBLIC_LEN + TAG_LEN]);
+        raw.send(&hello).unwrap();
         let mut rx = Authenticated::new(b, key(1));
         assert_eq!(rx.try_recv().unwrap(), None);
         assert_eq!(rx.rejected(), 1);
@@ -744,6 +870,56 @@ mod tests {
         tx.inner_mut().inner.send(&tampered).unwrap();
         assert_eq!(rx.try_recv().unwrap(), None);
         assert_eq!(rx.rejected(), 1);
+    }
+
+    #[test]
+    fn a_tampered_challenge_is_refused() {
+        // An attacker who changes the receiver's public key in the challenge
+        // would learn nothing useful, but the sender must still refuse it.
+        let (a, b) = Loopback::pair();
+        let mut tx = Authenticated::new(recorder(a), key(1));
+        let mut rx = Authenticated::new(recorder(b), key(1));
+        tx.send(&frame(0, b"x")).unwrap();
+        rx.try_recv().unwrap();
+        let mut challenge = rx
+            .inner_mut()
+            .log
+            .iter()
+            .find(|w| w.first() == Some(&TYPE_CHALLENGE))
+            .unwrap()
+            .clone();
+        challenge[2 + NONCE_LEN] ^= 0x01;
+        // Discard the genuine challenge, which is still waiting for the sender.
+        tx.inner_mut().inner.try_recv().unwrap();
+        rx.inner_mut().inner.send(&challenge).unwrap();
+        assert_eq!(tx.try_recv().unwrap(), None);
+        assert_eq!(tx.rejected(), 1);
+        assert!(tx.peer_session.is_none());
+    }
+
+    #[test]
+    fn a_challenge_for_an_earlier_hello_is_refused() {
+        let (a, b) = Loopback::pair();
+        let mut tx = Authenticated::new(recorder(a), key(1));
+        let mut rx = Authenticated::new(recorder(b), key(1));
+        tx.send(&frame(0, b"x")).unwrap();
+        rx.try_recv().unwrap();
+        let old = rx
+            .inner_mut()
+            .log
+            .iter()
+            .find(|w| w.first() == Some(&TYPE_CHALLENGE))
+            .unwrap()
+            .clone();
+
+        // Discard the genuine challenge, which is still waiting for the sender.
+        tx.inner_mut().inner.try_recv().unwrap();
+        // The sender starts again, so its ephemeral key has changed.
+        tx.renew().unwrap();
+        rx.inner_mut().inner.send(&old).unwrap();
+        assert_eq!(tx.try_recv().unwrap(), None);
+        assert_eq!(tx.rejected(), 1);
+        assert!(tx.peer_session.is_none());
     }
 
     #[test]
@@ -822,6 +998,22 @@ mod tests {
     }
 
     #[test]
+    fn session_keys_are_fresh_and_are_not_the_pre_shared_key() {
+        let (a, b) = Loopback::pair();
+        let mut tx = Authenticated::new(recorder(a), key(1));
+        let mut rx = Authenticated::new(b, key(1));
+        deliver(&mut tx, &mut rx, &frame(0, b"one"));
+        let first = tx.peer_session.as_ref().unwrap().key.clone();
+        assert_ne!(first, key(1));
+
+        tx.renew().unwrap();
+        rx.try_recv().unwrap();
+        tx.try_recv().unwrap();
+        let second = tx.peer_session.as_ref().unwrap().key.clone();
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn a_restarted_receiver_recovers_without_renew() {
         let (a, b) = Loopback::pair();
         let mut tx = Authenticated::new(recorder(a), key(1));
@@ -868,7 +1060,7 @@ mod tests {
     }
 
     #[test]
-    fn rotation_switches_keys_without_a_new_session() {
+    fn rotation_starts_a_new_session_under_the_new_key() {
         let (a, b) = Loopback::pair();
         let mut tx = Authenticated::new(recorder(a), key(1));
         let mut rx = Authenticated::new(b, key(1));
@@ -878,9 +1070,11 @@ mod tests {
         rx.install_key(1, key(2));
         tx.install_key(1, key(2));
         tx.activate_key(1).unwrap();
+        rx.activate_key(1).unwrap();
         let f1 = frame(1, b"after");
         assert_eq!(deliver(&mut tx, &mut rx, &f1), vec![f1.clone()]);
         assert_eq!(rx.rejected(), 0);
+        assert_eq!(tx.peer_session.as_ref().unwrap().psk_id, 1);
     }
 
     #[test]
