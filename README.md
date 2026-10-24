@@ -29,7 +29,7 @@ to be pushed first.
 
 ## Examples
 
-Each runs with no hardware: `cargo run --example <name>`.
+Each runs with no hardware, except `serial_bridge`: `cargo run --example <name>`.
 
 | Example | Shows |
 | --- | --- |
@@ -43,6 +43,7 @@ Each runs with no hardware: `cargo run --example <name>`.
 | `reliable_link` | Exactly-once delivery over a link losing 30 % of frames (`reliable::Channel`) |
 | `reconnect` | `Reconnector` and `Heartbeat` keeping a UDP link up |
 | `schema_roundtrip` | A protobuf `Ack` inside a frame (`--features proto`) |
+| `serial_bridge` | Forwards frames between a serial port and a UDP peer, unchanged (`--features serial`, needs hardware) |
 
 ## Command-line helper
 
@@ -125,6 +126,9 @@ of band. See the `auth` module docs before relying on it.
   `serial`), and `FaultyTransport` for tests.
 - **Link**: sequence numbers, loss counts, a `Heartbeat` for liveness, and a
   `Reconnector` with exponential backoff. See `examples/reconnect.rs`.
+- **Supervisor**: keeps a `Session` up over a reopenable transport. It reconnects
+  through a connect function you supply, drops the link when the peer goes silent,
+  and can give up after a set number of attempts (`supervisor`).
 - **Messages**: an optional `envelope` layer puts a type byte (data, heartbeat,
   ack, error) in the payload, and `Session` sends heartbeats and tracks liveness.
   The frame format is unchanged, so a plain `Link` still interoperates.
@@ -135,6 +139,15 @@ of band. See the `auth` module docs before relying on it.
 - **Protobuf core**: `Heartbeat`, `Ack` and `Error` in `proto/tpt_link.proto`,
   generated into `schema` (feature `proto`). Regenerate with
   `cargo run --manifest-path tools/gen-schema/Cargo.toml`, which needs `protoc`.
+
+## Documentation and tools
+
+- [docs/wire-format.md](docs/wire-format.md): the frame format byte by byte, with a worked example.
+- [docs/auth-threat-model.md](docs/auth-threat-model.md): what `auth` does and does not protect against.
+- [tools/wireshark/tpt-link.lua](tools/wireshark/tpt-link.lua): a Wireshark dissector for version 1
+  frames on UDP, with a CRC check. It is written from the wire-format guide and has not yet been
+  loaded in Wireshark.
+- `testdata/vectors.json`: golden frame vectors, checked against an independent CRC implementation.
 
 ## Development
 
