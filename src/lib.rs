@@ -16,6 +16,8 @@ pub mod frame;
 #[cfg(feature = "proto")]
 pub mod schema;
 
+#[cfg(feature = "auth")]
+pub mod auth;
 #[cfg(feature = "std")]
 pub mod can;
 #[cfg(all(feature = "can-socketcan", target_os = "linux"))]

@@ -45,7 +45,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        features: ["", "--features serial", "--features proto"]
+        features: ["", "--features serial", "--features proto", "--features auth"]
     steps:
       - uses: actions/checkout@v4
       - run: rustup show

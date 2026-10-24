@@ -24,10 +24,14 @@ serial = ["std", "dep:serial2"]
 can-socketcan = ["std", "dep:socketcan"]
 # Protobuf core messages (proto/tpt_link.proto), generated with micropb. micropb is MIT OR Apache-2.0.
 proto = ["dep:micropb"]
+# Message authentication for frames carried in the open (UDP, CAN). hmac and sha2 are MIT OR Apache-2.0 (RustCrypto).
+auth = ["std", "dep:hmac", "dep:sha2"]
 
 [dependencies]
 serial2 = { version = "0.2.38", optional = true }
 micropb = { version = "0.6", optional = true }
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 socketcan = { version = "4", default-features = false, optional = true }
@@ -40,3 +44,7 @@ required-features = ["proto"]
 name = "tpt-link-cli"
 path = "src/bin/tpt-link-cli.rs"
 required-features = ["std"]
+
+[[example]]
+name = "authenticated_udp"
+required-features = ["auth"]
