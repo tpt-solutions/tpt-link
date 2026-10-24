@@ -13,6 +13,13 @@ changes bump the minor version.
 - `UdpTransport` drops datagrams from any address other than the peer, and counts
   them in `foreign()`.
 
+### Changed (breaking)
+- `Link::poll` drops a frame whose sequence number has already arrived, and counts
+  it in the new `LinkStats::duplicates`. Duplicates used to be delivered. A late
+  frame that fills an earlier gap is still delivered, if it is within the last 64
+  sequence numbers.
+- `LinkStats` has a new `duplicates` field.
+
 ### Fixed
 - `Link::poll` no longer loses payloads that arrived before a transport error. It
   returns them, and reports the error on the next call.
@@ -29,6 +36,9 @@ changes bump the minor version.
 - `VirtualBus` no longer panics on a poisoned lock.
 
 ### Added
+- `FaultyTransport`: `corrupt_version_next`, `truncate_next`, `duplicate_next`,
+  `reorder_next` (with `release_held`), and seeded `random_loss`. Random loss
+  repeats for the same seed, so a failing test can be replayed.
 - `envelope`: optional typed messages (Data, Heartbeat, Ack, Error) in the frame
   payload, and `Session`, which sends heartbeats on a schedule and tracks peer
   liveness. The frame format is unchanged. Example: `session`.
