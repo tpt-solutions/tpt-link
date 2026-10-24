@@ -21,6 +21,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --features serial -- -D warnings
+      - run: cargo clippy --all-targets --features proto -- -D warnings
       - run: cargo clippy --lib --no-default-features -- -D warnings
 
   test:
@@ -30,7 +31,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        features: ["", "--features serial"]
+        features: ["", "--features serial", "--features proto"]
     steps:
       - uses: actions/checkout@v4
       - run: rustup show
@@ -44,6 +45,20 @@ jobs:
       - run: rustup show
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 
+  socketcan:
+    name: SocketCAN over vcan0
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - name: Create virtual CAN interface
+        run: |
+          sudo modprobe vcan
+          sudo ip link add dev vcan0 type vcan
+          sudo ip link set up vcan0
+      - run: cargo clippy --all-targets --features can-socketcan -- -D warnings
+      - run: cargo test --features can-socketcan --test socketcan
+
   no-std:
     name: no_std build (${{ matrix.target }})
     runs-on: ubuntu-latest
@@ -56,6 +71,7 @@ jobs:
       - run: rustup target add ${{ matrix.target }}
       - run: cargo build --no-default-features --target ${{ matrix.target }}
       - run: cargo build --no-default-features --features alloc --target ${{ matrix.target }}
+      - run: cargo build --no-default-features --features proto --target ${{ matrix.target }}
 
   deny:
     name: cargo deny

@@ -22,8 +22,13 @@ Features: `std` (default), `alloc`, `serial`. See spec section 9.
   `serial`), and `FaultyTransport` for tests.
 - **Link**: sequence numbers, loss counts, a `Heartbeat` for liveness, and a
   `Reconnector` with exponential backoff. See `examples/reconnect.rs`.
-- **Fragmentation**: splits messages larger than a small MTU, for CAN, and
-  reassembles them with expiry (`fragment`).
+- **Fragmentation**: splits messages larger than a small MTU, and reassembles them
+  with expiry (`fragment`).
+- **CAN**: `CanTransport` carries link frames over any `CanBus`. `SocketCanBus`
+  (feature `can-socketcan`, Linux) and `VirtualBus` for tests are included.
+- **Protobuf core**: `Heartbeat`, `Ack` and `Error` in `proto/tpt_link.proto`,
+  generated into `schema` (feature `proto`). Regenerate with
+  `cargo run --manifest-path tools/gen-schema/Cargo.toml`, which needs `protoc`.
 
 ## Development
 
@@ -32,6 +37,8 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo test --features serial
 cargo run --example reconnect
+cargo test --features proto
+cargo test --features can-socketcan --test socketcan   # Linux, needs vcan0
 cargo deny check licenses bans sources advisories
 ```
 

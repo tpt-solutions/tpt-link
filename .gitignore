@@ -31,3 +31,6 @@ Thumbs.db
 *.pem
 *.key
 *.secret
+
+# Build output of nested tools (tools/*/ are separate crates)
+/tools/*/target/

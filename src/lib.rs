@@ -13,9 +13,13 @@
 extern crate alloc;
 
 pub mod frame;
+#[cfg(feature = "proto")]
+pub mod schema;
 
 #[cfg(feature = "std")]
 pub mod can;
+#[cfg(all(feature = "can-socketcan", target_os = "linux"))]
+pub mod can_socketcan;
 #[cfg(feature = "std")]
 pub mod fault;
 #[cfg(feature = "std")]

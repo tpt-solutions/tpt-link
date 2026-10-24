@@ -4,7 +4,7 @@
 [package]
 name = "tpt-link"
 description = "Shared wire layer for the TPT ecosystem: frame format, transports, sequencing, heartbeat and reconnect"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -20,6 +20,14 @@ alloc = []
 std = ["alloc"]
 # Serial and USB-CDC transport. serial2 is BSD-2-Clause OR Apache-2.0.
 serial = ["std", "dep:serial2"]
+# SocketCAN bus for Linux. socketcan is MIT. Linux only.
+can-socketcan = ["std", "dep:socketcan"]
+# Protobuf core messages (proto/tpt_link.proto), generated with micropb. micropb is MIT OR Apache-2.0.
+proto = ["dep:micropb"]
 
 [dependencies]
 serial2 = { version = "0.2.38", optional = true }
+micropb = { version = "0.6", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+socketcan = { version = "4", default-features = false, optional = true }

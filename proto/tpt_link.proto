@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 TPT Solutions
+
+// Shared core messages for tpt-link. They travel inside frame payloads (spec
+// section 1). Each repo adds its own messages in its own package.
+//
+// Compatibility rules (spec section 11): field numbers are never reused or
+// renumbered, and removed fields are reserved. A change that breaks a field
+// meaning goes in a new package version, tpt.link.v2.
+
+syntax = "proto3";
+
+package tpt.link.v1;
+
+// Explicit liveness probe for a higher layer. Any frame already keeps a link
+// alive (spec section 7). Heartbeat only helps when a peer has nothing else to
+// send.
+message Heartbeat {}
+
+// Acknowledges the frame whose sequence number is `seq`.
+message Ack {
+  uint32 seq = 1;
+}
+
+// A numeric error code. The meaning of each code belongs to the repo that
+// defines it, so the core carries no text.
+message Error {
+  uint32 code = 1;
+}

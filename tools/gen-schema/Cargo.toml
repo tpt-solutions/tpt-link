@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) 2026 TPT Solutions
+
+[package]
+name = "gen-schema"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Not part of the tpt-link workspace. It is a build tool with its own dependencies.
+[workspace]
+
+[dependencies]
+micropb-gen = "0.6"
