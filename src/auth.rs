@@ -26,9 +26,11 @@
 //! What it does not give:
 //!
 //! - **Confidentiality.** Payloads travel in the clear.
-//! - **Automatic recovery from restarts.** After either side restarts, call
-//!   `renew` on the sender. Until then its frames are refused, and they are not
-//!   resent.
+//! - **Lossless restarts.** When the receiver restarts, it sends a resync for
+//!   the first frame it cannot verify, and the sender starts a new session. That
+//!   frame is lost, and so are frames sent before the resync arrives. A sender
+//!   that restarts begins a session on its first send. `renew` forces a new
+//!   session when the application wants one.
 //! - **Hello flooding protection.** A replayed hello makes the receiver issue a
 //!   new nonce, which ends the current session. That is denial of service, not
 //!   a way to inject frames.
@@ -57,6 +59,9 @@ pub const NONCE_LEN: usize = 16;
 const TYPE_HELLO: u8 = 0xC0;
 /// First byte of a challenge.
 const TYPE_CHALLENGE: u8 = 0xC1;
+/// First byte of a resync. Sent by a receiver that has no session with the
+/// sender, which tells the sender to start one again with a hello.
+const TYPE_RESYNC: u8 = 0xC2;
 /// Frames held back while the session is being set up. The oldest are dropped
 /// beyond this.
 const MAX_PENDING: usize = 32;
@@ -118,6 +123,9 @@ pub struct Authenticated<T> {
     issued: Option<Issued>,
     pending: VecDeque<Vec<u8>>,
     polls_since_hello: u32,
+    /// True once a resync has been sent for the current lack of a session, so
+    /// a stream of unverifiable frames gets one resync, not one per frame.
+    resync_sent: bool,
     rejected: u64,
     replayed: u64,
     dropped_pending: u64,
@@ -133,6 +141,7 @@ impl<T> Authenticated<T> {
             issued: None,
             pending: VecDeque::new(),
             polls_since_hello: 0,
+            resync_sent: false,
             rejected: 0,
             replayed: 0,
             dropped_pending: 0,
@@ -219,6 +228,25 @@ impl<T: Transport> Authenticated<T> {
         self.inner.send(&wire)
     }
 
+    /// Tells the sender that there is no session, so it should send a hello.
+    fn send_resync(&mut self) -> Result<(), T::Error> {
+        let mut wire = vec![TYPE_RESYNC];
+        wire.extend_from_slice(&tag_over(&self.key, &[&[TYPE_RESYNC]]));
+        self.inner.send(&wire)
+    }
+
+    /// The peer has no session with us. Forget its nonce, and say hello so that
+    /// it issues a new one. Frames that were already queued go out after that.
+    fn take_resync(&mut self, wire: &[u8]) -> Result<(), T::Error> {
+        if wire.len() != 1 + TAG_LEN || !verify_over(&self.key, &[&[TYPE_RESYNC]], &wire[1..]) {
+            self.rejected += 1;
+            return Ok(());
+        }
+        self.peer_nonce = None;
+        self.polls_since_hello = 0;
+        self.send_hello()
+    }
+
     /// Sends the queued frames, now that the peer's nonce is known.
     fn flush(&mut self) -> Result<(), T::Error> {
         let Some(nonce) = self.peer_nonce else {
@@ -248,6 +276,7 @@ impl<T: Transport> Authenticated<T> {
                 nonce
             }
         };
+        self.resync_sent = false;
         let mut out = vec![TYPE_CHALLENGE];
         out.extend_from_slice(&nonce);
         out.extend_from_slice(&tag_over(&self.key, &[&[TYPE_CHALLENGE], &nonce]));
@@ -275,34 +304,39 @@ impl<T: Transport> Authenticated<T> {
     }
 
     /// Checks a data message. Returns the frame if it is new and authentic.
-    fn take_data(&mut self, wire: Vec<u8>) -> Option<Vec<u8>> {
+    fn take_data(&mut self, wire: Vec<u8>) -> Result<Option<Vec<u8>>, T::Error> {
         let Some(issued) = self.issued.as_mut() else {
-            // No session has been started with this peer, so nothing can be valid.
+            // No session with this peer. A restart on our side is the usual
+            // reason, so tell the sender to start again.
             self.rejected += 1;
-            return None;
+            if !self.resync_sent {
+                self.resync_sent = true;
+                self.send_resync()?;
+            }
+            return Ok(None);
         };
         if wire.len() < TAG_LEN + HEADER_LEN {
             self.rejected += 1;
-            return None;
+            return Ok(None);
         }
         let (frame, sent_tag) = wire.split_at(wire.len() - TAG_LEN);
         if !verify_over(&self.key, &[&issued.nonce, frame], sent_tag) {
             self.rejected += 1;
-            return None;
+            return Ok(None);
         }
         if frame.first() != Some(&VERSION) {
             self.rejected += 1;
-            return None;
+            return Ok(None);
         }
         let seq = u32::from_le_bytes([frame[1], frame[2], frame[3], frame[4]]);
         match issued.window.arrive_strict(seq) {
             Arrival::New { .. } => {
                 issued.in_use = true;
-                Some(frame.to_vec())
+                Ok(Some(frame.to_vec()))
             }
             Arrival::Repeat | Arrival::Stale => {
                 self.replayed += 1;
-                None
+                Ok(None)
             }
         }
     }
@@ -342,8 +376,9 @@ impl<T: Transport> Transport for Authenticated<T> {
             match wire.first() {
                 Some(&TYPE_HELLO) => self.answer_hello(&wire)?,
                 Some(&TYPE_CHALLENGE) => self.take_challenge(&wire)?,
+                Some(&TYPE_RESYNC) => self.take_resync(&wire)?,
                 _ => {
-                    if let Some(frame) = self.take_data(wire) {
+                    if let Some(frame) = self.take_data(wire)? {
                         return Ok(Some(frame));
                     }
                 }
@@ -554,5 +589,49 @@ mod tests {
         }
         assert_eq!(got.len(), MAX_PENDING);
         assert_eq!(got[0], frame(8, b"q"));
+    }
+
+    #[test]
+    fn a_restarted_receiver_recovers_without_renew() {
+        let (a, b) = Loopback::pair();
+        let mut tx = Authenticated::new(recorder(a), key(1));
+        let mut rx = Authenticated::new(b, key(1));
+        let f0 = frame(0, b"before the restart");
+        assert_eq!(deliver(&mut tx, &mut rx, &f0), vec![f0.clone()]);
+
+        // The receiver restarts: its session state is lost, but the transport
+        // survives.
+        let mut rx = Authenticated::new(rx.into_inner(), key(1));
+
+        // This frame is sent under the old session and is refused. The refusal
+        // makes the receiver send a resync.
+        tx.send(&frame(1, b"lost")).unwrap();
+        assert_eq!(rx.try_recv().unwrap(), None);
+        tx.try_recv().unwrap(); // takes the resync and says hello
+        assert_eq!(rx.try_recv().unwrap(), None); // answers the hello
+        tx.try_recv().unwrap(); // takes the challenge
+
+        let f2 = frame(2, b"after the restart");
+        assert_eq!(deliver(&mut tx, &mut rx, &f2), vec![f2.clone()]);
+    }
+
+    #[test]
+    fn a_resync_is_sent_once_for_a_stream_of_refused_frames() {
+        let (a, b) = Loopback::pair();
+        let mut tx = recorder(a);
+        let mut rx = Authenticated::new(recorder(b), key(1));
+        for seq in 0..3 {
+            tx.inner.send(&frame(seq, b"x")).unwrap();
+        }
+        assert_eq!(rx.try_recv().unwrap(), None);
+        assert_eq!(rx.rejected(), 3);
+
+        let resyncs = rx
+            .inner_mut()
+            .log
+            .iter()
+            .filter(|w| w.first() == Some(&TYPE_RESYNC))
+            .count();
+        assert_eq!(resyncs, 1);
     }
 }
