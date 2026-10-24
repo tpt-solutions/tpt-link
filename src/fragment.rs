@@ -180,6 +180,18 @@ impl Reassembler {
 
     /// Drops partial messages older than the timeout. Returns how many were
     /// dropped.
+    ///
+    /// ```
+    /// use tpt_link::fragment::{split, Reassembler};
+    ///
+    /// let frames = split(2, b"never completed", 8).unwrap();
+    /// let mut rx = Reassembler::new(1_000);
+    /// rx.push(0, &frames[0]).unwrap();
+    /// assert_eq!(rx.pending(), 1);
+    /// assert_eq!(rx.expire(1_000), 0); // not yet older than the timeout
+    /// assert_eq!(rx.expire(1_001), 1);
+    /// assert_eq!(rx.pending(), 0);
+    /// ```
     pub fn expire(&mut self, now_us: u64) -> usize {
         let before = self.pending.len();
         let timeout = self.timeout_us;
@@ -189,6 +201,15 @@ impl Reassembler {
     }
 
     /// Number of messages still waiting for fragments.
+    ///
+    /// ```
+    /// use tpt_link::fragment::{split, Reassembler};
+    ///
+    /// let frames = split(3, b"two fragments", 10).unwrap();
+    /// let mut rx = Reassembler::new(1_000);
+    /// rx.push(0, &frames[0]).unwrap();
+    /// assert_eq!(rx.pending(), 1);
+    /// ```
     pub fn pending(&self) -> usize {
         self.pending.len()
     }

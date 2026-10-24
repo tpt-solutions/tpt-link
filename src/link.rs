@@ -95,11 +95,31 @@ impl<T: Transport> Link<T> {
     }
 
     /// Sets the sequence number the next `send` will use.
+    ///
+    /// ```
+    /// use tpt_link::{Link, Loopback};
+    ///
+    /// let (a, _b) = Loopback::pair();
+    /// let mut a = Link::new(a);
+    /// a.set_next_seq(u32::MAX);
+    /// assert_eq!(a.send(b"last").unwrap(), u32::MAX);
+    /// assert_eq!(a.send(b"wrapped").unwrap(), 0);
+    /// ```
     pub fn set_next_seq(&mut self, seq: u32) {
         self.next_seq = seq;
     }
 
     /// Frames and sends `payload`, and returns the sequence number it used.
+    ///
+    /// ```
+    /// use tpt_link::{Link, Loopback};
+    ///
+    /// let (a, _b) = Loopback::pair();
+    /// let mut a = Link::new(a);
+    /// assert_eq!(a.send(b"first").unwrap(), 0);
+    /// assert_eq!(a.send(b"second").unwrap(), 1);
+    /// assert_eq!(a.stats().sent, 2);
+    /// ```
     pub fn send(&mut self, payload: &[u8]) -> Result<u32, LinkError<T::Error>> {
         let seq = self.next_seq;
         let mut wire = Vec::new();
@@ -133,6 +153,14 @@ impl<T: Transport> Link<T> {
     }
 
     /// Gives back the underlying transport.
+    ///
+    /// ```
+    /// use tpt_link::{Link, Loopback};
+    ///
+    /// let (a, _b) = Loopback::pair();
+    /// let link = Link::new(a);
+    /// let _transport: Loopback = link.into_inner();
+    /// ```
     pub fn into_inner(self) -> T {
         self.transport
     }

@@ -22,8 +22,34 @@ impl std::error::Error for Closed {}
 /// `try_recv` returns one whole frame.
 ///
 /// UDP and CAN map onto this directly. Serial and USB-CDC are byte streams, so
-/// they need a reassembler that finds frame boundaries before they can
-/// implement this trait.
+/// they need a deframer (see `stream`) that finds frame boundaries before they
+/// can implement this trait.
+///
+/// A minimal implementation that records what is sent and returns nothing:
+///
+/// ```
+/// use std::convert::Infallible;
+/// use tpt_link::Transport;
+///
+/// #[derive(Default)]
+/// struct Sink(Vec<Vec<u8>>);
+///
+/// impl Transport for Sink {
+///     type Error = Infallible;
+///     fn send(&mut self, frame: &[u8]) -> Result<(), Infallible> {
+///         self.0.push(frame.to_vec());
+///         Ok(())
+///     }
+///     fn try_recv(&mut self) -> Result<Option<Vec<u8>>, Infallible> {
+///         Ok(None)
+///     }
+/// }
+///
+/// let mut t = Sink::default();
+/// t.send(b"out").unwrap();
+/// assert_eq!(t.try_recv().unwrap(), None);
+/// assert_eq!(t.0, vec![b"out".to_vec()]);
+/// ```
 pub trait Transport {
     /// Error type returned by this transport.
     type Error: std::error::Error;

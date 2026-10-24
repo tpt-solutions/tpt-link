@@ -8,7 +8,7 @@
 //! Reads use a short timeout so that `try_recv` never blocks for long.
 
 use std::io::{self, ErrorKind};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serial2::SerialPort;
 
@@ -20,6 +20,9 @@ use crate::transport::Transport;
 const READ_TIMEOUT: Duration = Duration::from_millis(1);
 /// Bytes requested per read call.
 const READ_CHUNK: usize = 256;
+/// Stall timeout for a partly received frame. A 1024-byte frame at 115200 bps
+/// takes about 90 ms, so a gap of 500 ms means the frame is damaged, not slow.
+const STALL_TIMEOUT_US: u64 = 500_000;
 
 /// A serial port carrying link frames.
 ///
@@ -32,6 +35,10 @@ const READ_CHUNK: usize = 256;
 pub struct SerialTransport {
     port: SerialPort,
     deframer: Deframer,
+    /// The `Transport` trait has no time argument, so stall timing is measured
+    /// from this origin. It is the only clock read in the crate, and it is
+    /// needed because the trait cannot take a time.
+    origin: Instant,
 }
 
 impl SerialTransport {
@@ -42,8 +49,18 @@ impl SerialTransport {
         port.set_read_timeout(READ_TIMEOUT)?;
         Ok(Self {
             port,
-            deframer: Deframer::new(),
+            deframer: Deframer::with_timeout(STALL_TIMEOUT_US),
+            origin: Instant::now(),
         })
+    }
+
+    /// Number of bytes discarded because a partly received frame stalled.
+    pub fn stalls(&self) -> u64 {
+        self.deframer.timeouts()
+    }
+
+    fn now_us(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_micros()).unwrap_or(u64::MAX)
     }
 }
 
@@ -55,18 +72,19 @@ impl Transport for SerialTransport {
     }
 
     fn try_recv(&mut self) -> io::Result<Option<Vec<u8>>> {
+        let now = self.now_us();
         // Frames already buffered come out first, before touching the port.
-        if let Some(frame) = self.deframer.next_frame() {
+        if let Some(frame) = self.deframer.next_frame_at(now) {
             return Ok(Some(frame));
         }
 
         let mut buf = [0u8; READ_CHUNK];
         match self.port.read(&mut buf) {
             Ok(0) => {}
-            Ok(n) => self.deframer.push(&buf[..n]),
+            Ok(n) => self.deframer.push_at(&buf[..n], now),
             Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {}
             Err(e) => return Err(e),
         }
-        Ok(self.deframer.next_frame())
+        Ok(self.deframer.next_frame_at(now))
     }
 }

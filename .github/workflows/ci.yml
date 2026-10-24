@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) 2026 TPT Solutions
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: fmt and clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rustup reads rust-toolchain.toml, so the pinned toolchain is installed.
+      - run: rustup show
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --features serial -- -D warnings
+      - run: cargo clippy --lib --no-default-features -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.features }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        features: ["", "--features serial"]
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - run: cargo test --all-targets ${{ matrix.features }}
+
+  docs:
+    name: cargo doc with warnings denied
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+
+  no-std:
+    name: no_std build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [thumbv7em-none-eabihf, riscv32imc-unknown-none-elf]
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --no-default-features --target ${{ matrix.target }}
+      - run: cargo build --no-default-features --features alloc --target ${{ matrix.target }}
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans sources advisories

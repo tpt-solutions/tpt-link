@@ -15,6 +15,8 @@ extern crate alloc;
 pub mod frame;
 
 #[cfg(feature = "std")]
+pub mod can;
+#[cfg(feature = "std")]
 pub mod fault;
 #[cfg(feature = "std")]
 pub mod fragment;

@@ -39,6 +39,13 @@ impl UdpTransport {
     }
 
     /// The local address the socket is bound to.
+    ///
+    /// ```
+    /// use tpt_link::UdpTransport;
+    ///
+    /// let t = UdpTransport::bind("127.0.0.1:0", "127.0.0.1:9".parse().unwrap()).unwrap();
+    /// assert!(t.local_addr().unwrap().port() != 0);
+    /// ```
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }

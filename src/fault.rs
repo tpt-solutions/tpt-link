@@ -44,6 +44,19 @@ impl<T> FaultyTransport<T> {
     }
 
     /// Corrupts each of the next `count` frames, so the receiver sees a CRC failure.
+    ///
+    /// ```
+    /// use tpt_link::{FaultyTransport, Link, Loopback};
+    ///
+    /// let (a, b) = Loopback::pair();
+    /// let mut a = Link::new(FaultyTransport::new(a));
+    /// let mut b = Link::new(b);
+    /// a.transport_mut().corrupt_next(1);
+    /// a.send(b"damaged").unwrap();
+    /// a.send(b"intact").unwrap();
+    /// assert_eq!(b.poll().unwrap(), vec![b"intact".to_vec()]);
+    /// assert_eq!(b.stats().crc_errors, 1);
+    /// ```
     pub fn corrupt_next(&mut self, count: usize) {
         self.corrupt_remaining += count;
     }

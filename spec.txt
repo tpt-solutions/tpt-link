@@ -77,9 +77,14 @@ yields only complete, CRC-valid frames:
   - A frame whose CRC fails: discard one byte and scan on. Discarding the whole
     claimed length would hide a good frame that follows.
 
-Known weakness: a corrupted length field can make the deframer wait for bytes
-that never arrive, stalling the stream. A timeout would fix this. It is an
-open item (section 13).
+Stall timeout: a corrupted length field can make the deframer wait for bytes
+that never arrive. A deframer built with `with_timeout(timeout_us)` closes that
+gap. When no byte has arrived for `timeout_us`, it discards one byte and rescans,
+so a good frame behind the bad length is delivered. Each discard is counted.
+The caller supplies the time (`push_at`, `next_frame_at`), per P4. The timeout
+must be longer than the longest gap inside a valid frame, or valid frames are
+lost. SerialTransport uses 500 ms, which is far above the time a 1024-byte frame
+takes at 115200 bps (about 90 ms).
 
 5. Transport abstraction
 
@@ -102,7 +107,9 @@ Transports:
   - SerialTransport (feature `serial`): serial2, with a 1 ms read timeout on
     every platform. Windows clamps timeouts to at least 1 ms, so 1 ms is used
     everywhere to keep behaviour identical.
-  - CAN: planned. See section 10 and section 13.
+  - CanTransport (module can, std): a link frame over a CanBus, fragmented per
+    section 10. VirtualBus is the in-memory bus for tests. SocketCAN and the
+    Windows adapter are not yet implemented (section 13, item 3).
 
 6. Link: sequencing and loss
 
@@ -147,7 +154,14 @@ Recommended defaults (chosen for tpt-hands, not fixed by this spec): initial
 100 ms, cap 5 s. Callers set their own.
 
 Reconnector does not touch the transport. The caller opens it, and reports the
-result. The same policy serves every transport.
+result. The same policy serves every transport. examples/reconnect.rs shows the
+wiring to a UDP transport, with a Heartbeat deciding when an open link is dead.
+
+Caveat: a UDP "open" is only a local bind, so it succeeds even when the peer is
+absent. Backoff therefore applies only to open failures. A link that opens but
+goes silent is retried at the heartbeat timeout, not on the backoff schedule.
+Transports where opening means reaching the peer (serial, CAN) do not have this
+gap.
 
 9. Feature matrix
 
@@ -155,7 +169,7 @@ result. The same policy serves every transport.
   (none)     frame (no_std core, decode only)                     core
   alloc      frame encoding                                       alloc
   std        Link, Heartbeat, Reconnect, fragmentation, stream,   alloc
-             transports (Loopback, Fault, UDP)
+             transports (Loopback, Fault, UDP, CanTransport, VirtualBus)
   serial     SerialTransport                                      std, serial2
 
 The `std` feature is default. The MCU firmware uses the core with no features.
@@ -186,6 +200,27 @@ Reassembly:
 
 Decision: classic CAN is the baseline. CAN-FD is the same code with MTU 64.
 
+CAN transport (src/can.rs). A link frame is fragmented and sent as CAN data
+frames. The receiver reassembles it, so the stack above sees one frame per
+message, as with UDP.
+  - CanBus is the raw bus: send_raw(id, data) and recv_raw(). SocketCAN and the
+    Windows adapter implement it. VirtualBus is an in-memory bus for tests.
+  - Identifier, standard 11-bit: bits 10..8 hold the sender node (0 to 7) and
+    bits 7..0 hold the message id. A lower node wins arbitration, so nodes
+    0 to 7 fit one bus. Every fragment of one message uses the same identifier.
+  - Message id: each sender has its own counter, which starts at 0 and wraps at
+    256. The receiver keeps one reassembler per sending node, because ids are
+    unique only per sender.
+  - Wraparound: a reused id is detected by the fragment count, as in the rules
+    above. A same-count collision is possible only while an old partial message
+    is still waiting. The timeout bounds that window, so the timeout must be
+    well under the time 256 messages take to send.
+  - A node ignores frames it sent itself.
+  - Time: try_recv_at(now) expires partial messages. Transport::try_recv reads
+    the time from an Instant taken at construction, because the trait has no
+    time argument.
+  - Damaged fragments are counted (bad_fragments) and dropped.
+
 11. Versioning and compatibility
 
   - The frame version is 1. A change to the frame layout requires a new version
@@ -208,8 +243,9 @@ Decision: classic CAN is the baseline. CAN-FD is the same code with MTU 64.
   - Serial: the open-error path only. A real port round trip needs a bench.
   - Doc tests on the main public types and functions. Not every item has one yet.
   - no_std builds for the MCU targets (thumbv7em-none-eabihf,
-    riscv32imc-unknown-none-elf). These are checked by hand so far. CI is
-    planned: this repo has none yet.
+    riscv32imc-unknown-none-elf). CI is defined in .github/workflows/ci.yml. It
+    runs fmt, clippy, tests on three operating systems, cargo doc with warnings
+    denied, both MCU builds, and cargo deny.
 
 13. Open items
 
@@ -218,10 +254,12 @@ Decision: classic CAN is the baseline. CAN-FD is the same code with MTU 64.
      developers. The draft in tpt-hands/proto is provisional and must be
      reconciled with the real schema once it is found or recreated here.
   2. Serial round trip on real hardware.
-  3. CAN transport: SocketCAN (Linux) and a Windows adapter. Both need a licence
-     check first.
-  4. Deframer timeout for corrupted length fields (section 4).
-  5. Reconnect is not yet wired to a live transport in any consumer.
+  3. CAN hardware: the CanTransport layer is done and tested over VirtualBus.
+     SocketCAN (Linux) and a Windows adapter remain. Both need a licence check
+     first.
+  4. Resolved: the deframer stall timeout (section 4).
+  5. Partly resolved: Reconnector is wired to UDP in examples/reconnect.rs. No
+     consumer uses it yet, and the open-means-reachable caveat (section 8) stands.
   6. Go implementation. tpt-link is Rust-only. A Go wire package is needed by
      tpt-swarm's Go services, and would be a separate module.
   7. Hosting. This repo exists locally. It has not been pushed anywhere.

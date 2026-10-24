@@ -9,9 +9,11 @@
 //! deframer drops one byte and scans on, so a damaged frame does not hide the
 //! good frame that follows it.
 //!
-//! One weakness: a corrupted length field can make the deframer wait for bytes
-//! that never come, which stalls the stream until enough data has arrived.
-//! Closing that gap needs a timeout, and that is future work.
+//! A corrupted length field can make the deframer wait for bytes that never
+//! come. To prevent this, a deframer built with `with_timeout` gives up on a
+//! stalled frame: when no byte has arrived for `timeout_us`, it discards one
+//! byte and rescans. The caller supplies the time (principle P4), so the
+//! behaviour can be tested exactly.
 
 use crate::frame::{CRC_LEN, HEADER_LEN, MAX_PAYLOAD_LEN, VERSION, crc32};
 
@@ -31,15 +33,52 @@ use crate::frame::{CRC_LEN, HEADER_LEN, MAX_PAYLOAD_LEN, VERSION, crc32};
 /// d.push(&wire[3..]);
 /// assert_eq!(d.next_frame(), Some(wire));
 /// ```
+///
+/// With a timeout, a frame whose length field is corrupted does not stall the
+/// stream. The good frame behind it is delivered once the timeout passes.
+///
+/// ```
+/// use tpt_link::stream::Deframer;
+/// use tpt_link::frame::encode;
+///
+/// let mut good = Vec::new();
+/// // Sequence 2, not 1: a stale sequence byte equal to VERSION would look like
+/// // a frame start, and that costs one extra timeout to get past.
+/// encode(2, b"after", &mut good).unwrap();
+/// let mut bad = good.clone();
+/// bad[5..7].copy_from_slice(&1024u16.to_le_bytes()); // a length within the maximum
+///
+/// let mut d = Deframer::with_timeout(1_000);
+/// d.push_at(&bad[..7], 0);
+/// d.push_at(&good, 0);
+/// assert_eq!(d.next_frame_at(500), None);  // still within the timeout
+/// assert_eq!(d.next_frame_at(1_000), Some(good));
+/// assert_eq!(d.timeouts(), 1);
+/// ```
 #[derive(Debug, Default)]
 pub struct Deframer {
     buf: Vec<u8>,
+    /// Stall timeout in microseconds. `None` means the deframer never gives up.
+    timeout_us: Option<u64>,
+    /// Time of the most recent byte received, or of the most recent discard.
+    last_activity_us: u64,
+    timeouts: u64,
 }
 
 impl Deframer {
-    /// Creates an empty deframer.
+    /// Creates an empty deframer with no stall timeout.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates an empty deframer that discards a stalled frame after
+    /// `timeout_us` without any new bytes. The timeout must be longer than the
+    /// longest gap between bytes of a valid frame, or valid frames are lost.
+    pub fn with_timeout(timeout_us: u64) -> Self {
+        Self {
+            timeout_us: Some(timeout_us),
+            ..Self::default()
+        }
     }
 
     /// Appends bytes received from the wire.
@@ -47,9 +86,41 @@ impl Deframer {
         self.buf.extend_from_slice(bytes);
     }
 
+    /// Appends bytes received at `now_us`. The time is used by `next_frame_at`
+    /// to measure stalls.
+    pub fn push_at(&mut self, bytes: &[u8], now_us: u64) {
+        self.push(bytes);
+        self.last_activity_us = now_us;
+    }
+
+    /// Like `next_frame`, but applies the stall timeout as of `now_us`. Each
+    /// timed-out byte is counted in `timeouts`. Returns `None` when more bytes
+    /// are needed.
+    pub fn next_frame_at(&mut self, now_us: u64) -> Option<Vec<u8>> {
+        loop {
+            if let Some(frame) = self.next_frame() {
+                return Some(frame);
+            }
+            // With no frame ready, the buffer is either empty or holds the start
+            // of a frame that is still incomplete.
+            let timeout_us = self.timeout_us?;
+            if self.buf.is_empty() || now_us.saturating_sub(self.last_activity_us) < timeout_us {
+                return None;
+            }
+            self.buf.remove(0);
+            self.timeouts += 1;
+            self.last_activity_us = now_us;
+        }
+    }
+
+    /// Number of bytes discarded because a frame stalled past the timeout.
+    pub fn timeouts(&self) -> u64 {
+        self.timeouts
+    }
+
     /// Returns the next complete, CRC-valid frame, including its header and
     /// CRC so that `frame::decode` can parse it. Returns `None` when more bytes
-    /// are needed.
+    /// are needed. This never applies the stall timeout.
     pub fn next_frame(&mut self) -> Option<Vec<u8>> {
         loop {
             if self.buf.first() != Some(&VERSION) {
@@ -92,6 +163,15 @@ impl Deframer {
     }
 
     /// Bytes buffered and not yet consumed.
+    ///
+    /// ```
+    /// use tpt_link::stream::Deframer;
+    ///
+    /// let mut d = Deframer::new();
+    /// d.push(&[0x00, 0x00]); // line noise, discarded as soon as a frame is looked for
+    /// assert_eq!(d.next_frame(), None);
+    /// assert_eq!(d.buffered(), 0);
+    /// ```
     pub fn buffered(&self) -> usize {
         self.buf.len()
     }
@@ -177,5 +257,63 @@ mod tests {
         let frame = wire_of(9, b"ok");
         d.push(&frame);
         assert_eq!(d.next_frame(), Some(frame));
+    }
+
+    /// A frame header whose length claims 1024 bytes, which never arrive.
+    fn stalled_header() -> Vec<u8> {
+        let mut header = wire_of(5, b"x")[..HEADER_LEN].to_vec();
+        header[5..7].copy_from_slice(&1024u16.to_le_bytes());
+        header
+    }
+
+    #[test]
+    fn corrupted_length_stalls_then_recovers() {
+        let good = wire_of(6, b"behind the bad length");
+        let mut d = Deframer::with_timeout(1_000);
+        d.push_at(&stalled_header(), 0);
+        d.push_at(&good, 0);
+        assert_eq!(d.next_frame_at(999), None);
+        assert_eq!(d.timeouts(), 0);
+        assert_eq!(d.next_frame_at(1_000), Some(good));
+        assert_eq!(d.timeouts(), 1);
+    }
+
+    #[test]
+    fn stalled_header_with_nothing_behind_it_is_cleared() {
+        let mut d = Deframer::with_timeout(1_000);
+        d.push_at(&stalled_header(), 0);
+        assert_eq!(d.next_frame_at(999), None);
+        assert_eq!(d.buffered(), HEADER_LEN);
+        assert_eq!(d.next_frame_at(1_000), None);
+        assert_eq!(d.timeouts(), 1);
+        assert_eq!(d.buffered(), 0);
+    }
+
+    #[test]
+    fn slow_but_valid_frame_is_not_timed_out() {
+        let frame = wire_of(8, b"slow sender");
+        let mut d = Deframer::with_timeout(1_000);
+        let mut now = 0;
+        let mut chunks = frame.chunks(3).peekable();
+        while let Some(chunk) = chunks.next() {
+            d.push_at(chunk, now);
+            if chunks.peek().is_none() {
+                assert_eq!(d.next_frame_at(now), Some(frame.clone()));
+            } else {
+                // Each gap is shorter than the timeout, so the frame must survive.
+                now += 900;
+                assert_eq!(d.next_frame_at(now), None);
+            }
+        }
+        assert_eq!(d.timeouts(), 0);
+    }
+
+    #[test]
+    fn deframer_without_timeout_never_discards_on_time_alone() {
+        let mut d = Deframer::new();
+        d.push_at(&stalled_header(), 0);
+        assert_eq!(d.next_frame_at(u64::MAX), None);
+        assert_eq!(d.timeouts(), 0);
+        assert_eq!(d.buffered(), HEADER_LEN);
     }
 }
