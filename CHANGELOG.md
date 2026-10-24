@@ -3,6 +3,45 @@
 All notable changes to this crate. Versions follow semver. Below 1.0.0, breaking
 changes bump the minor version.
 
+## Unreleased
+
+### Changed (breaking)
+- `frame::FrameError::BadCrc` fields are now `carried` and `computed` (they were
+  `expected` and `actual`, which read the wrong way round).
+- `LinkStats` has a new `bad_version` counter. Frames with an unknown version
+  were counted in `malformed` before.
+- `UdpTransport` drops datagrams from any address other than the peer, and counts
+  them in `foreign()`.
+
+### Fixed
+- `Link::poll` no longer loses payloads that arrived before a transport error. It
+  returns them, and reports the error on the next call.
+- `Link::poll` delivers every frame in a datagram, not only the first.
+- Reordered or duplicate frames no longer count as extra loss. A large backward
+  jump in sequence numbers is treated as a peer restart.
+- `Reconnector::on_link_down` does nothing while the link is already down, so
+  calling it on every tick no longer defeats the backoff. A zero initial backoff
+  is raised to 1 us.
+- `Reassembler` replaces a stale partial message when a fragment conflicts with it,
+  so a reused message id cannot splice two messages together.
+- `CanTransport` masks the sender to 3 bits and rejects an MTU with no room for data.
+- `UdpTransport` no longer returns Windows `ConnectionReset` from `try_recv`.
+- `VirtualBus` no longer panics on a poisoned lock.
+
+### Added
+- `envelope`: optional typed messages (Data, Heartbeat, Ack, Error) in the frame
+  payload, and `Session`, which sends heartbeats on a schedule and tracks peer
+  liveness. The frame format is unchanged. Example: `session`.
+- `CanBus::max_data_len` and `CanError::MtuTooLarge`: an MTU the bus cannot carry
+  is rejected by `CanTransport::new`. `SocketCanBus` reports classic CAN (8).
+- `Deframer` buffer cap (`stream::MAX_BUFFER`) with an `overflowed()` counter. Byte
+  scanning is linear, and CRC-32 is table-driven (1 KiB of read-only data).
+- `Reassembler::replaced()` and `expired()`, and the matching totals on `CanTransport`.
+- Examples: `loopback_hello`, `udp_echo`, `can_fragment`, `fault_injection`,
+  `heartbeat_monitor`, `schema_roundtrip`.
+- CI: MSRV job, no_std test job, schema drift check, caching, concurrency,
+  weekly advisories, and a tag-triggered release workflow.
+
 ## 0.2.0
 
 ### Added

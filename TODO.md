@@ -67,3 +67,44 @@ Legend: [x] done, [ ] to do. Section numbers refer to spec.txt.
 - [x] Update spec status (partly implemented -> current) and version (0.2.0)
 - [x] CHANGELOG.md
 - [ ] Tag v0.2.0 (annotated tag, pushed with master)
+
+## G. Bug fixes from the review (add a regression test for each)
+- [x] Link::poll keeps payloads already received when the transport then errors; the error is reported on the next poll (src/link.rs). Tested in tests/loopback.rs
+- [x] Link::poll decodes every frame in a datagram, not only the first. Tested in tests/loopback.rs
+- [x] Reordered or duplicate frames no longer cause false loss; a large backward jump resyncs as a peer restart. Tested in tests/loopback.rs
+- [x] Reconnector::on_link_down is idempotent while down; Backoff::new(0, _) raised to 1 us. Still open: optional jitter and max attempts
+- [x] Deframer: buffer capped (MAX_BUFFER, overflowed counter), linear-time scan, table-driven CRC-32. Still open: stall clock resets on every discarded byte, push/push_at timing consistency
+- [x] Fragment/CAN reassembly: a conflicting fragment (different count or data) replaces a stale partial, with `replaced`/`expired` counters; sender masked to 3 bits; MTU validated in CanTransport::new
+- [x] SocketCAN: `CanBus::max_data_len` makes CanTransport::new reject an FD MTU on a classic-only bus (`MtuTooLarge`); recv loop bounded; Interrupted handled. NOT compiled here (Linux only), so CI must confirm. Still open: CAN filters, FD sockets, surfacing error frames
+- [x] Serial: Interrupted handled, stall clock re-sampled after the read, partial-write behaviour and the 1 ms read documented. Not tried on hardware
+- [x] UDP: datagrams from other addresses dropped and counted (`foreign`); ConnectionReset no longer surfaces as an error
+- [x] Small: BadCrc fields renamed to carried/computed; `bad_version` stat; VirtualBus no longer panics on a poisoned lock
+- [x] `cargo test --no-default-features --lib` compiles again (frame.rs tests gated on `alloc`); CI runs it
+
+## H. New features
+- [x] Message envelope with a type tag (Data, Heartbeat, Ack, Error) and `Session` with automatic heartbeats (src/envelope.rs). Optional layer, wire format unchanged. Still open: reconcile its Ack/Error bodies with the protobuf schema messages (spec 13.1)
+- [ ] Opt-in reliability layer: ACK, retransmit, window (schema already has Ack)
+- [ ] Opt-in authentication (truncated HMAC or AEAD trailer); CRC is not authentication
+- [ ] Driver helper combining Session + Reconnector (what examples/reconnect.rs does by hand); Session already covers Link + Heartbeat
+- [ ] Richer FaultyTransport: reorder, duplicate, truncate, header corruption, latency, seeded RNG
+- [ ] tokio adapter feature; tracing or defmt feature
+- [ ] tpt-link-cli: decode hex, listen on UDP/serial/CAN, send, bridge, record/replay
+- [ ] Wireshark Lua dissector for the frame format
+- [ ] Fuzz targets (Deframer, frame::decode, Reassembler) and proptest round trips
+- [ ] Golden test vectors file (testdata/vectors.json); C header or Python binding
+
+## I. Adoption
+- [x] Examples: loopback_hello, udp_echo, can_fragment, heartbeat_monitor, fault_injection, schema_roundtrip (all run without hardware)
+- [ ] Examples still to write: serial_bridge (needs a port), no_std MCU
+- [ ] cargo-generate templates: host app, Cortex-M node, CAN gateway
+- [x] README: quickstart, git dependency snippet, example, transport and feature tables, MSRV, troubleshooting. Still open: badges (needs the pushed repo and tag)
+- [ ] docs/wire-format.md with byte diagrams; include README in lib.rs docs
+- [ ] Cargo.toml metadata (repository, readme, keywords, categories); decide crates.io vs git dependency
+- [ ] CONTRIBUTING, SECURITY, issue and PR templates, CODEOWNERS, .gitattributes, .editorconfig; clean .gitignore; Keep a Changelog format
+
+## J. CI and automation
+- [x] ci.yml: concurrency, permissions: contents: read, push branch filter, rust-cache, job timeouts. Still open: SHA-pinned actions (tags used; SHAs could not be looked up offline)
+- [x] CI jobs: MSRV 1.85 (default and serial; `proto` needs 1.88), no_std tests, gen-schema drift check. Still open: --all-features test run, alloc-only test of the whole lib
+- [x] vcan step skips the SocketCAN test with a warning if the module is unavailable
+- [x] Weekly advisories workflow, Dependabot (cargo and actions). Still open: cargo-semver-checks, coverage
+- [x] Tag-triggered release.yml (tag vs Cargo.toml vs CHANGELOG, GitHub Release), scripts/setup-vcan.sh. Still open: justfile or xtask
