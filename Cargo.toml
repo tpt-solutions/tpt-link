@@ -61,3 +61,7 @@ serde_json = "1"
 [[example]]
 name = "authenticated_udp"
 required-features = ["auth"]
+
+[[example]]
+name = "serial_bridge"
+required-features = ["serial"]

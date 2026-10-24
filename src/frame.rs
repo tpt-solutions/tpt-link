@@ -186,6 +186,7 @@ pub fn decode(buf: &[u8]) -> Result<(Frame<'_>, usize), FrameError> {
 #[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn crc32_matches_check_value() {

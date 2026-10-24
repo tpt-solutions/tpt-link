@@ -89,18 +89,20 @@ Legend: [x] done, [ ] to do. Section numbers refer to spec.txt.
 - [x] Richer FaultyTransport: reorder (with release_held), duplicate, truncate, version corruption, seeded random loss. Still open: latency and jitter
 - [ ] tokio adapter feature; tracing or defmt feature
 - [x] tpt-link-cli: encode, decode and crc, offline (src/bin/tpt-link-cli.rs). Still open: listen on UDP/serial/CAN, send, bridge, record/replay
-- [ ] Wireshark Lua dissector for the frame format
+- [x] Wireshark Lua dissector for the frame format (tools/wireshark/tpt-link.lua, UDP ports, CRC check). CRC algorithm checked against zlib; not yet loaded in Wireshark
 - [x] Randomised robustness tests (tests/robustness.rs): decode invariants, noisy-stream recovery, lost-fragment splices over CAN. Still open: cargo-fuzz targets and proptest round trips (needs a nightly toolchain or new dependencies)
 - [ ] Golden test vectors file: done as testdata/vectors.json (tests/vectors.rs, generated with Python zlib). Still open: C header or Python binding
 
 ## I. Adoption
 - [x] Examples: loopback_hello, udp_echo, can_fragment, heartbeat_monitor, fault_injection, schema_roundtrip (all run without hardware)
-- [ ] Examples still to write: serial_bridge (needs a port), no_std MCU (not started; both need hardware or a cross target to verify)
+- [x] Example serial_bridge (examples/serial_bridge.rs, feature serial). Compiles; not run on hardware
+- [ ] Examples still to write: no_std MCU (not started; needs a cross target to verify)
 - [ ] cargo-generate templates: host app, Cortex-M node, CAN gateway
 - [x] README: quickstart, git dependency snippet, example, transport and feature tables, MSRV, troubleshooting. Still open: badges (needs the pushed repo and tag)
 - [ ] docs/wire-format.md with byte diagrams: done. Still open: include README in lib.rs docs
 - [x] Cargo.toml metadata (repository, readme, keywords, categories). Decision: stay on git dependency (publish = false)
-- [ ] CONTRIBUTING, SECURITY, issue and PR templates, .gitattributes, .editorconfig, clean .gitignore: done. Still open: CODEOWNERS (needs the owners' GitHub handles), and tidy the CHANGELOG headings to Keep a Changelog form
+- [x] CHANGELOG headings tidied to Keep a Changelog form (Added / Changed / Fixed under Unreleased)
+- [x] CODEOWNERS (.github/CODEOWNERS): owner set to @PhillipC05 for all paths, with explicit rules for the wire format, auth, docs/auth-threat-model.md and .github/
 
 ## J. CI and automation
 - [x] ci.yml: concurrency, permissions: contents: read, push branch filter, rust-cache, job timeouts. Still open: SHA-pinned actions (tags used; SHAs could not be looked up offline)
