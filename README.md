@@ -80,26 +80,28 @@ cargo run --bin tpt-link-cli -- crc 123456789         # 0xcbf43926
 ## Authentication
 
 The CRC only catches damage. On UDP or CAN, anyone who can reach the port or the
-bus can forge frames. Wrap the transport in `auth::Authenticated` and every frame
-is encrypted and authenticated with ChaCha20-Poly1305, keyed with a 32-byte shared
-secret. Listeners cannot read the payloads, and forged or
-altered frames are dropped and counted before they reach the link.
+bus can forge frames. Wrap the transport in `auth::Authenticated`. Each session
+then runs an X25519 key exchange, authenticated with a pre-shared key, and every
+frame is sealed with ChaCha20-Poly1305 under the session key. Forged or altered
+frames are dropped and counted before they reach the link.
 
-Replays are refused too. The receiver issues a random nonce to each session, and
-frames verify only under that nonce, so a recording from an earlier session fails.
+Replays are refused too. Each session has a random nonce that the receiver
+chooses, and a recording from an earlier session fails because its key is gone.
 Within a session, repeats and frames too far back to check are refused.
+
+Session keys come from fresh ephemeral keys, so an earlier session stays secret
+even if the pre-shared key leaks later. The pre-shared key still authenticates
+the handshake, so keep it secret and rotate it: install the new key under a new
+id on both ends, activate it on both, then retire the old id. Key distribution
+is out of band, and there is no certificate or key exchange with a third party.
 
 Restarts recover on their own. When the receiver restarts, the first frame it
 cannot verify triggers a resync, and the sender begins a new session. That frame
-and any sent before the resync arrives are lost, so use a `reliable::Channel` above
-it if loss matters.
+and any sent before the resync arrives are lost, so use a `reliable::Channel`
+above it if loss matters.
 
-Keys are identified by a one-byte id, and each message carries it. To rotate,
-install the new key under a new id on both ends, activate it on both, then retire
-the old id. Keys are still shared out of band, and there is no key exchange.
-
-Limits: keys are shared out of band, and frame sizes and timing are visible. See the
-`auth` module docs before relying on it.
+Limits: frame sizes and timing are visible, and the pre-shared key is shared out
+of band. See the `auth` module docs before relying on it.
 
 ## Troubleshooting
 

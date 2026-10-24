@@ -44,7 +44,10 @@ changes bump the minor version.
 
 ### Added
 - `auth::Authenticated` (feature `auth`): seals every frame with ChaCha20-Poly1305 and
-  drops frames that do not open. Control messages carry an HMAC-SHA256 tag. Keys
+  drops frames that do not open. Each session runs an X25519 exchange authenticated
+  with a pre-shared key, and data is sealed under the derived session key, so the
+  session keys are fresh and earlier sessions stay secret. Control messages carry an
+  HMAC-SHA256 tag. Pre-shared keys carry
   carry a one-byte id. `install_key`, `activate_key` and `retire_key` rotate them
   (up to four keys held at once). The receiver issues a random nonce per
   session, and frames verify only under it, so frames from an earlier session and
