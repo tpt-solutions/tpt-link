@@ -84,7 +84,7 @@ Legend: [x] done, [ ] to do. Section numbers refer to spec.txt.
 ## H. New features
 - [x] Message envelope with a type tag (Data, Heartbeat, Ack, Error) and `Session` with automatic heartbeats (src/envelope.rs). Optional layer, wire format unchanged. Still open: reconcile its Ack/Error bodies with the protobuf schema messages (spec 13.1)
 - [x] Opt-in reliability layer: reliable::Channel (ids, acks, retransmit, exactly-once delivery). Not ordered, no congestion control, no persistence across restarts. Still open: ordered delivery mode
-- [ ] Opt-in authentication (truncated HMAC or AEAD trailer); CRC is not authentication
+- [x] Opt-in authentication: auth::Authenticated (HMAC-SHA256, 16-byte tag, feature auth). Still open: replay protection (needs a counter or timestamp in the frame), confidentiality (AEAD), key rotation
 - [ ] Driver helper combining Session + Reconnector (what examples/reconnect.rs does by hand); Session already covers Link + Heartbeat
 - [x] Richer FaultyTransport: reorder (with release_held), duplicate, truncate, version corruption, seeded random loss. Still open: latency and jitter
 - [ ] tokio adapter feature; tracing or defmt feature

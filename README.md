@@ -39,6 +39,7 @@ Each runs with no hardware: `cargo run --example <name>`.
 | `heartbeat_monitor` | Declaring a silent peer dead, with injected time |
 | `can_fragment` | A 600-byte frame over classic CAN, on a virtual bus |
 | `session` | Typed messages, automatic heartbeats and liveness (`envelope::Session`) |
+| `authenticated_udp` | Forged frames rejected over UDP (`--features auth`) |
 | `reliable_link` | Exactly-once delivery over a link losing 30 % of frames (`reliable::Channel`) |
 | `reconnect` | `Reconnector` and `Heartbeat` keeping a UDP link up |
 | `schema_roundtrip` | A protobuf `Ack` inside a frame (`--features proto`) |
@@ -74,6 +75,18 @@ cargo run --bin tpt-link-cli -- crc 123456789         # 0xcbf43926
 | `serial` | `SerialTransport` |
 | `can-socketcan` | `SocketCanBus` (Linux) |
 | `proto` | Protobuf core messages in `schema` |
+| `auth` | `auth::Authenticated`: HMAC-SHA256 tag on every frame (see below) |
+
+## Authentication
+
+The CRC only catches damage. On UDP or CAN, anyone who can reach the port or the
+bus can forge frames. Wrap the transport in `auth::Authenticated` to append a
+16-byte HMAC-SHA256 tag, keyed with a 32-byte shared secret. Forged or altered
+frames are dropped and counted before they reach the link.
+
+It does not encrypt payloads, and it does not stop replay: a recorded frame still
+verifies, and the link only drops it while its sequence number is in the window.
+Keys are shared and not rotated. See the `auth` module docs before relying on it.
 
 ## Troubleshooting
 

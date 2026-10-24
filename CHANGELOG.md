@@ -43,6 +43,9 @@ changes bump the minor version.
   Exhaustive matches need an arm for it.
 
 ### Added
+- `auth::Authenticated` (feature `auth`): appends a 16-byte HMAC-SHA256 tag to every
+  frame and drops frames that do not verify. It gives integrity and origin, not
+  confidentiality or replay protection. Example: `authenticated_udp`.
 - `reliable::Channel`: acknowledged delivery over a `Transport`. Each message gets an
   id, every copy is acknowledged, and unacknowledged messages are sent again after
   `retransmit_us`. The caller receives each message once. Delivery is exactly-once,
