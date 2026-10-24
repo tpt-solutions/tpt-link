@@ -269,8 +269,11 @@ message, as with UDP.
   4. Resolved: the deframer stall timeout (section 4).
   5. Partly resolved: Reconnector is wired to UDP in examples/reconnect.rs. No
      consumer uses it yet, and the open-means-reachable caveat (section 8) stands.
-  6. Go implementation. tpt-link is Rust-only. A Go wire package is needed by
-     tpt-swarm's Go services, and would be a separate module.
+  6. Go implementation. Resolved in go/tpt-link: a frame codec (stdlib only) that
+     passes the shared golden vectors, and the core schema generated from
+     proto/tpt_link.proto with protoc-gen-go (BSD-3). An Ack test checks the Go
+     bytes against the Rust encoding. Go depends on google.golang.org/protobuf
+     only, which is BSD-3-Clause and passes section 14.
   7. Hosting. This repo exists locally. It has not been pushed anywhere.
   8. Security layer above the link (signed handshakes, replay protection) is
      Phase 3 work in tpt-hands and is not specified here.
