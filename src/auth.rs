@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 TPT Solutions
 
-//! Message authentication for frames carried in the open, such as UDP and CAN.
-//! Enabled with the `auth` feature.
+//! Message authentication and encryption for frames carried in the open, such as
+//! UDP and CAN. Enabled with the `auth` feature.
 //!
 //! The link CRC catches damage, but anyone who can reach the port or the bus
 //! can compute it, so it cannot tell a real frame from a forged one.
 //! `Authenticated` wraps a transport and seals every frame with
-//! ChaCha20-Poly1305, keyed with a 32-byte shared key. Control messages (hello,
-//! challenge and resync) carry a 16-byte HMAC-SHA256 tag instead, since they
-//! hide nothing.
+//! ChaCha20-Poly1305. Control messages (hello, challenge and resync) carry a
+//! 16-byte HMAC-SHA256 tag instead, since they hide nothing.
+//!
+//! Keys are identified by a one-byte id, which every message carries. The
+//! sender seals with its active key. The receiver accepts any installed key.
 //!
 //! Replay is stopped by a session nonce, which the receiver chooses:
 //!
@@ -23,9 +25,9 @@
 //!    numbers too far back to check, rather than treating them as a restart.
 //!
 //! What this gives: every frame that reaches the link was made by a holder of
-//! the key, for the session the receiver is in, and was not altered. A replay
-//! from an earlier session or from far back in this one is refused. Payloads
-//! are encrypted, so a listener cannot read them.
+//! an installed key, for the session the receiver is in, and was not altered.
+//! A replay from an earlier session or from far back in this one is refused.
+//! Payloads are encrypted, so a listener cannot read them.
 //!
 //! What it does not give:
 //!
@@ -37,7 +39,9 @@
 //! - **Hello flooding protection.** A replayed hello makes the receiver issue a
 //!   new nonce, which ends the current session. That is denial of service, not
 //!   a way to inject frames.
-//! - **Key management.** The key is shared out of band and is not rotated.
+//! - **Automatic key exchange.** Keys are shared out of band. Rotation is done
+//!   by the application: install the new key on both ends, activate it on both,
+//!   then retire the old key. See `install_key`.
 //! - **Traffic analysis.** Frame sizes and timing are visible.
 
 use std::collections::VecDeque;
@@ -56,12 +60,15 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Bytes in a shared key.
 pub const KEY_LEN: usize = 32;
-/// Bytes of tag on each message.
+/// Bytes of tag on each control message, and on each sealed frame.
 pub const TAG_LEN: usize = 16;
 /// Bytes in a session nonce.
 pub const NONCE_LEN: usize = 16;
 /// Bytes in the random nonce sent with each data message.
 const MESSAGE_NONCE_LEN: usize = 12;
+/// Most keys a receiver accepts at once. Two overlap a rotation. The rest is
+/// headroom for a slow rollout.
+const MAX_KEYS: usize = 4;
 
 /// First byte of a hello. It is not a frame version, so the two never clash.
 const TYPE_HELLO: u8 = 0xC0;
@@ -97,6 +104,27 @@ impl fmt::Debug for Key {
     }
 }
 
+/// Why a key operation was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyError {
+    /// No key with this id is installed.
+    Unknown(u8),
+    /// The key is the active one, which cannot be retired. Activate another key
+    /// first.
+    Active(u8),
+}
+
+impl fmt::Display for KeyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown(id) => write!(f, "no key with id {id} is installed"),
+            Self::Active(id) => write!(f, "key {id} is active and cannot be retired"),
+        }
+    }
+}
+
+impl std::error::Error for KeyError {}
+
 /// The nonce this side issued to its peer, and what has arrived under it.
 #[derive(Debug)]
 struct Issued {
@@ -108,7 +136,7 @@ struct Issued {
     in_use: bool,
 }
 
-/// Wraps a transport and authenticates every frame.
+/// Wraps a transport and authenticates and encrypts every frame.
 ///
 /// ```
 /// use tpt_link::Loopback;
@@ -127,7 +155,10 @@ struct Issued {
 #[derive(Debug)]
 pub struct Authenticated<T> {
     inner: T,
-    key: Key,
+    /// Keys this side accepts, by id. The active key is always among them.
+    keys: Vec<(u8, Key)>,
+    /// Id of the key used to send.
+    active: u8,
     /// The nonce the peer issued to us. Our frames are sent under it.
     peer_nonce: Option<[u8; NONCE_LEN]>,
     /// The nonce we issued to the peer, if any.
@@ -143,11 +174,13 @@ pub struct Authenticated<T> {
 }
 
 impl<T> Authenticated<T> {
-    /// Wraps `inner`. Both ends must use the same key.
+    /// Wraps `inner`, with `key` as key 0 and active. Both ends must hold the
+    /// same key.
     pub fn new(inner: T, key: Key) -> Self {
         Self {
             inner,
-            key,
+            keys: vec![(0, key)],
+            active: 0,
             peer_nonce: None,
             issued: None,
             pending: VecDeque::new(),
@@ -159,8 +192,60 @@ impl<T> Authenticated<T> {
         }
     }
 
-    /// Messages dropped because their tag did not verify, or because they were
-    /// too short to carry one.
+    /// Accepts messages made under `key`, identified by `id`. Installing an id
+    /// that is already in use replaces its key. If the number of keys exceeds
+    /// the limit, the oldest one that is not active is dropped.
+    ///
+    /// To rotate: install the new key on both ends, activate it on both ends,
+    /// then retire the old key on both ends. Replacing the active key takes
+    /// effect at once, so the peer must already hold the replacement.
+    pub fn install_key(&mut self, id: u8, key: Key) {
+        if let Some(slot) = self.keys.iter_mut().find(|(k, _)| *k == id) {
+            slot.1 = key;
+            return;
+        }
+        self.keys.push((id, key));
+        if self.keys.len() > MAX_KEYS {
+            let active = self.active;
+            if let Some(oldest) = self.keys.iter().position(|(k, _)| *k != active) {
+                self.keys.remove(oldest);
+            }
+        }
+    }
+
+    /// Makes the key with this id the one used to send. Fails if no such key is
+    /// installed.
+    pub fn activate_key(&mut self, id: u8) -> Result<(), KeyError> {
+        if self.key_ref(id).is_some() {
+            self.active = id;
+            Ok(())
+        } else {
+            Err(KeyError::Unknown(id))
+        }
+    }
+
+    /// Stops accepting messages made under the key with this id. The active key
+    /// cannot be retired.
+    pub fn retire_key(&mut self, id: u8) -> Result<(), KeyError> {
+        if id == self.active {
+            return Err(KeyError::Active(id));
+        }
+        let before = self.keys.len();
+        self.keys.retain(|(k, _)| *k != id);
+        if self.keys.len() == before {
+            Err(KeyError::Unknown(id))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The id of the key used to send.
+    pub fn active_key_id(&self) -> u8 {
+        self.active
+    }
+
+    /// Messages dropped because they did not verify, were too short, or named a
+    /// key that is not installed.
     pub fn rejected(&self) -> u64 {
         self.rejected
     }
@@ -184,6 +269,19 @@ impl<T> Authenticated<T> {
     /// Gives back the underlying transport.
     pub fn into_inner(self) -> T {
         self.inner
+    }
+
+    fn key_ref(&self, id: u8) -> Option<&Key> {
+        self.keys.iter().find(|(k, _)| *k == id).map(|(_, key)| key)
+    }
+
+    /// The active key and its id. The active key is always installed, because
+    /// `new` installs it, `install_key` never drops it, and `retire_key` refuses it.
+    fn active_key(&self) -> (u8, &Key) {
+        let key = self
+            .key_ref(self.active)
+            .expect("the active key is always installed");
+        (self.active, key)
     }
 }
 
@@ -225,10 +323,10 @@ fn fresh_message_nonce() -> [u8; MESSAGE_NONCE_LEN] {
     nonce
 }
 
-/// A data message: its type byte, a fresh nonce, then the frame sealed with
-/// ChaCha20-Poly1305. The session nonce is bound in as associated data, so a
-/// message sealed in one session does not open in another.
-fn data_wire(key: &Key, session: &[u8; NONCE_LEN], frame: &[u8]) -> Vec<u8> {
+/// A data message: its type byte, its key id, a fresh nonce, then the frame
+/// sealed with ChaCha20-Poly1305. The session nonce is bound in as associated
+/// data, so a message sealed in one session does not open in another.
+fn data_wire(key: &Key, id: u8, session: &[u8; NONCE_LEN], frame: &[u8]) -> Vec<u8> {
     let nonce = fresh_message_nonce();
     let cipher = ChaCha20Poly1305::new_from_slice(&key.0).expect("the key is 32 bytes");
     let sealed = cipher
@@ -240,8 +338,9 @@ fn data_wire(key: &Key, session: &[u8; NONCE_LEN], frame: &[u8]) -> Vec<u8> {
             },
         )
         .expect("sealing a frame cannot fail");
-    let mut wire = Vec::with_capacity(1 + MESSAGE_NONCE_LEN + sealed.len());
+    let mut wire = Vec::with_capacity(2 + MESSAGE_NONCE_LEN + sealed.len());
     wire.push(TYPE_DATA);
+    wire.push(id);
     wire.extend_from_slice(&nonce);
     wire.extend_from_slice(&sealed);
     wire
@@ -271,22 +370,32 @@ impl<T: Transport> Authenticated<T> {
     }
 
     fn send_hello(&mut self) -> Result<(), T::Error> {
-        let mut wire = vec![TYPE_HELLO];
-        wire.extend_from_slice(&tag_over(&self.key, &[&[TYPE_HELLO]]));
+        let (id, key) = self.active_key();
+        let mut wire = vec![TYPE_HELLO, id];
+        wire.extend_from_slice(&tag_over(key, &[&[TYPE_HELLO], &[id]]));
         self.inner.send(&wire)
     }
 
     /// Tells the sender that there is no session, so it should send a hello.
     fn send_resync(&mut self) -> Result<(), T::Error> {
-        let mut wire = vec![TYPE_RESYNC];
-        wire.extend_from_slice(&tag_over(&self.key, &[&[TYPE_RESYNC]]));
+        let (id, key) = self.active_key();
+        let mut wire = vec![TYPE_RESYNC, id];
+        wire.extend_from_slice(&tag_over(key, &[&[TYPE_RESYNC], &[id]]));
         self.inner.send(&wire)
     }
 
     /// The peer has no session with us. Forget its nonce, and say hello so that
     /// it issues a new one. Frames that were already queued go out after that.
     fn take_resync(&mut self, wire: &[u8]) -> Result<(), T::Error> {
-        if wire.len() != 1 + TAG_LEN || !verify_over(&self.key, &[&[TYPE_RESYNC]], &wire[1..]) {
+        if wire.len() != 2 + TAG_LEN {
+            self.rejected += 1;
+            return Ok(());
+        }
+        let id = wire[1];
+        let valid = self
+            .key_ref(id)
+            .is_some_and(|key| verify_over(key, &[&[TYPE_RESYNC], &[id]], &wire[2..]));
+        if !valid {
             self.rejected += 1;
             return Ok(());
         }
@@ -301,14 +410,30 @@ impl<T: Transport> Authenticated<T> {
             return Ok(());
         };
         while let Some(frame) = self.pending.pop_front() {
-            self.inner.send(&data_wire(&self.key, &nonce, &frame))?;
+            let wire = self.seal_for_peer(&nonce, &frame);
+            self.inner.send(&wire)?;
         }
         Ok(())
     }
 
-    /// Answers a hello with a challenge holding a fresh nonce.
+    fn seal_for_peer(&self, session: &[u8; NONCE_LEN], frame: &[u8]) -> Vec<u8> {
+        let (id, key) = self.active_key();
+        data_wire(key, id, session, frame)
+    }
+
+    /// Answers a hello with a challenge holding a fresh nonce. The challenge
+    /// uses the key the hello named, so the sender can check it.
     fn answer_hello(&mut self, wire: &[u8]) -> Result<(), T::Error> {
-        if wire.len() != 1 + TAG_LEN || !verify_over(&self.key, &[&[TYPE_HELLO]], &wire[1..]) {
+        if wire.len() != 2 + TAG_LEN {
+            self.rejected += 1;
+            return Ok(());
+        }
+        let id = wire[1];
+        let Some(key) = self.key_ref(id).cloned() else {
+            self.rejected += 1;
+            return Ok(());
+        };
+        if !verify_over(&key, &[&[TYPE_HELLO], &[id]], &wire[2..]) {
             self.rejected += 1;
             return Ok(());
         }
@@ -325,27 +450,33 @@ impl<T: Transport> Authenticated<T> {
             }
         };
         self.resync_sent = false;
-        let mut out = vec![TYPE_CHALLENGE];
+        let mut out = vec![TYPE_CHALLENGE, id];
         out.extend_from_slice(&nonce);
-        out.extend_from_slice(&tag_over(&self.key, &[&[TYPE_CHALLENGE], &nonce]));
+        out.extend_from_slice(&tag_over(&key, &[&[TYPE_CHALLENGE], &[id], &nonce]));
         self.inner.send(&out)
     }
 
     /// Takes the peer's nonce from a challenge and sends the queued frames.
     fn take_challenge(&mut self, wire: &[u8]) -> Result<(), T::Error> {
-        let len = 1 + NONCE_LEN + TAG_LEN;
-        let valid = wire.len() == len
-            && verify_over(
-                &self.key,
-                &[&[TYPE_CHALLENGE], &wire[1..1 + NONCE_LEN]],
-                &wire[1 + NONCE_LEN..],
-            );
+        if wire.len() != 2 + NONCE_LEN + TAG_LEN {
+            self.rejected += 1;
+            return Ok(());
+        }
+        let id = wire[1];
+        let nonce_bytes = &wire[2..2 + NONCE_LEN];
+        let valid = self.key_ref(id).is_some_and(|key| {
+            verify_over(
+                key,
+                &[&[TYPE_CHALLENGE], &[id], nonce_bytes],
+                &wire[2 + NONCE_LEN..],
+            )
+        });
         if !valid {
             self.rejected += 1;
             return Ok(());
         }
         let mut nonce = [0u8; NONCE_LEN];
-        nonce.copy_from_slice(&wire[1..1 + NONCE_LEN]);
+        nonce.copy_from_slice(nonce_bytes);
         self.peer_nonce = Some(nonce);
         self.polls_since_hello = 0;
         self.flush()
@@ -354,23 +485,30 @@ impl<T: Transport> Authenticated<T> {
     /// Opens a data message and checks it. Returns the frame if it is new and
     /// authentic.
     fn take_data(&mut self, wire: &[u8]) -> Result<Option<Vec<u8>>, T::Error> {
-        let Some(issued) = self.issued.as_mut() else {
-            // No session with this peer. A restart on our side is the usual
-            // reason, so tell the sender to start again.
-            self.rejected += 1;
-            if !self.resync_sent {
-                self.resync_sent = true;
-                self.send_resync()?;
+        let session = match &self.issued {
+            Some(issued) => issued.nonce,
+            None => {
+                // No session with this peer. A restart on our side is the usual
+                // reason, so tell the sender to start again.
+                self.rejected += 1;
+                if !self.resync_sent {
+                    self.resync_sent = true;
+                    self.send_resync()?;
+                }
+                return Ok(None);
             }
-            return Ok(None);
         };
-        let body = &wire[1..];
-        if body.len() < MESSAGE_NONCE_LEN + TAG_LEN + HEADER_LEN {
+        if wire.len() < 2 + MESSAGE_NONCE_LEN + TAG_LEN + HEADER_LEN {
             self.rejected += 1;
             return Ok(None);
         }
-        let (nonce, sealed) = body.split_at(MESSAGE_NONCE_LEN);
-        let Some(frame) = open_data(&self.key, &issued.nonce, nonce, sealed) else {
+        let id = wire[1];
+        let Some(key) = self.key_ref(id).cloned() else {
+            self.rejected += 1;
+            return Ok(None);
+        };
+        let (nonce, sealed) = wire[2..].split_at(MESSAGE_NONCE_LEN);
+        let Some(frame) = open_data(&key, &session, nonce, sealed) else {
             self.rejected += 1;
             return Ok(None);
         };
@@ -379,6 +517,9 @@ impl<T: Transport> Authenticated<T> {
             return Ok(None);
         }
         let seq = u32::from_le_bytes([frame[1], frame[2], frame[3], frame[4]]);
+        let Some(issued) = self.issued.as_mut() else {
+            return Ok(None);
+        };
         match issued.window.arrive_strict(seq) {
             Arrival::New { .. } => {
                 issued.in_use = true;
@@ -397,7 +538,10 @@ impl<T: Transport> Transport for Authenticated<T> {
 
     fn send(&mut self, frame: &[u8]) -> Result<(), T::Error> {
         match self.peer_nonce {
-            Some(nonce) => self.inner.send(&data_wire(&self.key, &nonce, frame)),
+            Some(nonce) => {
+                let wire = self.seal_for_peer(&nonce, frame);
+                self.inner.send(&wire)
+            }
             None => {
                 if self.pending.len() == MAX_PENDING {
                     self.pending.pop_front();
@@ -523,8 +667,7 @@ mod tests {
         let (a, b) = Loopback::pair();
         let mut tx = Authenticated::new(recorder(a), key(1));
         let mut rx = Authenticated::new(b, key(1));
-        let f0 = frame(0, b"open valve");
-        deliver(&mut tx, &mut rx, &f0);
+        deliver(&mut tx, &mut rx, &frame(0, b"open valve"));
 
         let recorded = data_wires(&tx.inner_mut().log)[0].clone();
         tx.inner_mut().inner.send(&recorded).unwrap();
@@ -537,8 +680,7 @@ mod tests {
         let (a, b) = Loopback::pair();
         let mut tx = Authenticated::new(recorder(a), key(1));
         let mut rx = Authenticated::new(b, key(1));
-        let f0 = frame(0, b"open valve");
-        deliver(&mut tx, &mut rx, &f0);
+        deliver(&mut tx, &mut rx, &frame(0, b"open valve"));
         let old = data_wires(&tx.inner_mut().log)[0].clone();
 
         // A new session: the receiver issues a fresh nonce.
@@ -571,6 +713,19 @@ mod tests {
         let mut attacker = Authenticated::new(recorder(x), key(2));
         attacker.renew().unwrap();
         let mut rx = Authenticated::new(y, key(1));
+        assert_eq!(rx.try_recv().unwrap(), None);
+        assert_eq!(rx.rejected(), 1);
+        assert!(rx.issued.is_none());
+    }
+
+    #[test]
+    fn a_hello_naming_an_unknown_key_is_refused() {
+        let (mut raw, b) = Loopback::pair();
+        raw.send(&[
+            TYPE_HELLO, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ])
+        .unwrap();
+        let mut rx = Authenticated::new(b, key(1));
         assert_eq!(rx.try_recv().unwrap(), None);
         assert_eq!(rx.rejected(), 1);
         assert!(rx.issued.is_none());
@@ -661,8 +816,8 @@ mod tests {
         let session = [9; NONCE_LEN];
         let f = frame(0, b"same");
         assert_ne!(
-            data_wire(&key(1), &session, &f),
-            data_wire(&key(1), &session, &f)
+            data_wire(&key(1), 0, &session, &f),
+            data_wire(&key(1), 0, &session, &f)
         );
     }
 
@@ -697,7 +852,7 @@ mod tests {
         let mut rx = Authenticated::new(recorder(b), key(1));
         for seq in 0..3 {
             tx.inner
-                .send(&data_wire(&key(1), &[0; NONCE_LEN], &frame(seq, b"x")))
+                .send(&data_wire(&key(1), 0, &[0; NONCE_LEN], &frame(seq, b"x")))
                 .unwrap();
         }
         assert_eq!(rx.try_recv().unwrap(), None);
@@ -710,5 +865,67 @@ mod tests {
             .filter(|w| w.first() == Some(&TYPE_RESYNC))
             .count();
         assert_eq!(resyncs, 1);
+    }
+
+    #[test]
+    fn rotation_switches_keys_without_a_new_session() {
+        let (a, b) = Loopback::pair();
+        let mut tx = Authenticated::new(recorder(a), key(1));
+        let mut rx = Authenticated::new(b, key(1));
+        let f0 = frame(0, b"before");
+        assert_eq!(deliver(&mut tx, &mut rx, &f0), vec![f0.clone()]);
+
+        rx.install_key(1, key(2));
+        tx.install_key(1, key(2));
+        tx.activate_key(1).unwrap();
+        let f1 = frame(1, b"after");
+        assert_eq!(deliver(&mut tx, &mut rx, &f1), vec![f1.clone()]);
+        assert_eq!(rx.rejected(), 0);
+    }
+
+    #[test]
+    fn a_frame_under_a_retired_key_is_refused() {
+        let (a, b) = Loopback::pair();
+        let mut tx = Authenticated::new(recorder(a), key(1));
+        let mut rx = Authenticated::new(b, key(1));
+        deliver(&mut tx, &mut rx, &frame(0, b"before"));
+        let old = data_wires(&tx.inner_mut().log)[0].clone();
+
+        rx.install_key(1, key(2));
+        tx.install_key(1, key(2));
+        tx.activate_key(1).unwrap();
+        rx.activate_key(1).unwrap();
+        deliver(&mut tx, &mut rx, &frame(1, b"after"));
+        rx.retire_key(0).unwrap();
+
+        tx.inner_mut().inner.send(&old).unwrap();
+        assert_eq!(rx.try_recv().unwrap(), None);
+        assert_eq!(rx.rejected(), 1);
+    }
+
+    #[test]
+    fn key_management_refuses_unknown_and_active_keys() {
+        let (a, _) = Loopback::pair();
+        let mut tx = Authenticated::new(recorder(a), key(1));
+        assert_eq!(tx.activate_key(7), Err(KeyError::Unknown(7)));
+        assert_eq!(tx.retire_key(0), Err(KeyError::Active(0)));
+        assert_eq!(tx.retire_key(5), Err(KeyError::Unknown(5)));
+
+        tx.install_key(1, key(2));
+        tx.activate_key(1).unwrap();
+        assert_eq!(tx.active_key_id(), 1);
+        tx.retire_key(0).unwrap();
+    }
+
+    #[test]
+    fn the_oldest_inactive_key_is_dropped_past_the_limit() {
+        let (_, b) = Loopback::pair();
+        let mut rx = Authenticated::new(b, key(1));
+        for id in 1..=4 {
+            rx.install_key(id, key(id + 1));
+        }
+        // Five keys were installed, so the oldest inactive one, id 1, is gone.
+        assert_eq!(rx.retire_key(1), Err(KeyError::Unknown(1)));
+        assert!(rx.retire_key(2).is_ok());
     }
 }
