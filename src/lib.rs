@@ -30,6 +30,8 @@ pub mod fragment;
 pub mod link;
 #[cfg(feature = "std")]
 pub mod reconnect;
+#[cfg(feature = "std")]
+mod rng;
 #[cfg(feature = "serial")]
 pub mod serial;
 #[cfg(feature = "std")]

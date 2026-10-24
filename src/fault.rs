@@ -5,6 +5,7 @@
 //! outgoing frames in the ways a real wire does: loss, corruption, truncation,
 //! reordering, duplication, and random loss at a set rate.
 
+use crate::rng::Xorshift64;
 use crate::transport::Transport;
 
 /// Wraps a transport and damages outgoing frames on purpose.
@@ -42,19 +43,7 @@ pub struct FaultyTransport<T> {
 #[derive(Debug)]
 struct RandomLoss {
     per_million: u32,
-    state: u64,
-}
-
-impl RandomLoss {
-    fn next(&mut self) -> u32 {
-        // xorshift64, which is enough for choosing which frames to drop.
-        self.state ^= self.state << 13;
-        self.state ^= self.state >> 7;
-        self.state ^= self.state << 17;
-        // The high bits are the best ones; reduce them to the range 0..1_000_000.
-        let roll = (self.state >> 32) as u32;
-        roll % 1_000_000
-    }
+    rng: Xorshift64,
 }
 
 impl<T> FaultyTransport<T> {
@@ -136,13 +125,10 @@ impl<T> FaultyTransport<T> {
     /// generator seeded with `seed`. The same seed drops the same frames each
     /// run. Pass 0 to turn random loss off.
     pub fn random_loss(&mut self, per_million: u32, seed: u64) {
-        // xorshift cannot leave an all-zero state, so zero is replaced.
-        let state = if seed == 0 {
-            0x9E37_79B9_7F4A_7C15
-        } else {
-            seed
-        };
-        self.random_loss = (per_million > 0).then_some(RandomLoss { per_million, state });
+        self.random_loss = (per_million > 0).then_some(RandomLoss {
+            per_million,
+            rng: Xorshift64::new(seed),
+        });
     }
 
     /// Whether a frame is currently held back by `reorder_next`.
@@ -171,7 +157,7 @@ impl<T: Transport> Transport for FaultyTransport<T> {
             return Ok(());
         }
         if let Some(loss) = self.random_loss.as_mut() {
-            if loss.next() < loss.per_million {
+            if loss.rng.next_u32() % 1_000_000 < loss.per_million {
                 return Ok(());
             }
         }
