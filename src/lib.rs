@@ -21,6 +21,8 @@ pub mod can;
 #[cfg(all(feature = "can-socketcan", target_os = "linux"))]
 pub mod can_socketcan;
 #[cfg(feature = "std")]
+pub mod envelope;
+#[cfg(feature = "std")]
 pub mod fault;
 #[cfg(feature = "std")]
 pub mod fragment;
