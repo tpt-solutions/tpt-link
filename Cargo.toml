@@ -10,6 +10,10 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 authors = ["TPT Solutions"]
 publish = false
+repository = "https://github.com/tpt-solutions/tpt-link"
+readme = "README.md"
+keywords = ["framing", "crc", "embedded", "no-std", "transport"]
+categories = ["embedded", "network-programming", "no-std"]
 
 [features]
 # Default: everything, including the transports.
@@ -49,6 +53,10 @@ required-features = ["proto"]
 name = "tpt-link-cli"
 path = "src/bin/tpt-link-cli.rs"
 required-features = ["std"]
+
+[dev-dependencies]
+# Reads testdata/vectors.json in tests/vectors.rs. serde_json is MIT OR Apache-2.0.
+serde_json = "1"
 
 [[example]]
 name = "authenticated_udp"
