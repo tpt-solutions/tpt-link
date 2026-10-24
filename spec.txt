@@ -1,0 +1,236 @@
+tpt-link — Specification
+Version: 0.1.0 (draft)
+Status: Proposal, partly implemented
+Licence: MIT OR Apache-2.0 (dual). Copyright (c) 2026 TPT Solutions.
+Repository: tpt-link (this repo). Origin repo: tpt-hands, where the first
+  implementation was developed (crates/tpt-link, now moved here).
+
+1. Purpose
+
+tpt-link is the shared wire layer for the TPT ecosystem. It defines how framed,
+checksummed, sequenced messages travel over a link, whatever the physical
+transport: serial or USB-CDC, UDP, or CAN. Repos that exchange messages over a
+link build on it rather than each inventing their own framing.
+
+tpt-link owns:
+  - the frame format (section 3)
+  - the transport abstraction and the transports (sections 5, 9)
+  - sequencing and loss accounting (section 6)
+  - liveness and reconnect policy (sections 7, 8)
+  - byte-stream deframing and CAN fragmentation (sections 4, 10)
+
+tpt-link does not own:
+  - application message schemas. Each repo owns its own messages, encoded with
+    protobuf inside frame payloads. The shared schema is an open item (section 13).
+  - security. Handshakes and signatures are built above the link. The power
+    handshake is designed in tpt-hands, Phase 3.
+  - routing between endpoints, which belongs to the orchestrators (tpt-swarm).
+
+2. Design principles
+
+  P1. Damaged data never reaches the application. A frame that fails its CRC
+      is dropped, and the drop is counted.
+  P2. No dependency on other TPT repos. tpt-link depends only on permissive
+      crates, so it can be used anywhere.
+  P3. The core runs without std. The frame codec needs only `core` to decode and
+      `alloc` to encode, so the same bytes are checked on MCU firmware.
+  P4. Time is injected, never read from a global clock. Heartbeat and reconnect
+      take timestamps from the caller, so their behaviour can be tested exactly.
+  P5. Transports carry whole frames. Byte-stream transports add a deframer, so
+      the rest of the stack sees one interface.
+
+3. Frame format (version 1)
+
+All multi-byte integers are little-endian.
+
+  offset  size  field     meaning
+  0       1     version   1. Any other value is rejected.
+  1       4     seq       sender's sequence number. Wraps at 2^32.
+  5       2     length    payload length, at most 1024 (MAX_PAYLOAD_LEN).
+  7       n     payload   n = length bytes.
+  7+n     4     crc       CRC-32 (IEEE 802.3, reflected polynomial 0xEDB88320,
+                          initial value and final XOR 0xFFFFFFFF) over bytes
+                          0 .. 7+n-1.
+
+  Header length 7 bytes, trailer 4 bytes. Smallest frame: 11 bytes.
+  Check value: CRC-32 of the ASCII string "123456789" is 0xCBF43926.
+
+Decoding rules:
+  - Fewer bytes than the frame claims: Truncated.
+  - version != 1: BadVersion. Receivers must not guess at other versions.
+  - length > 1024: TooLarge.
+  - CRC mismatch: BadCrc, with both values reported.
+  Decoding returns the payload as a borrowed slice, and the number of bytes the
+  frame used, so that back-to-back frames can be decoded in turn.
+
+Encoding rules:
+  - Payload above 1024 bytes is rejected (TooLarge). It is never truncated.
+
+4. Byte-stream framing (deframer)
+
+Serial and USB-CDC deliver bytes, not frames. The deframer accumulates bytes and
+yields only complete, CRC-valid frames:
+
+  - Bytes that do not start with the version byte are discarded one at a time.
+  - A length above 1024 means the byte is not a frame start: discard one byte.
+  - An incomplete frame waits for more bytes.
+  - A frame whose CRC fails: discard one byte and scan on. Discarding the whole
+    claimed length would hide a good frame that follows.
+
+Known weakness: a corrupted length field can make the deframer wait for bytes
+that never arrive, stalling the stream. A timeout would fix this. It is an
+open item (section 13).
+
+5. Transport abstraction
+
+A transport carries whole frames (datagram semantics).
+
+  send(frame)      sends one frame.
+  try_recv()       returns the next waiting frame, or None. Never blocks.
+
+Errors are the transport's own type. Loopback reports Closed when the peer has
+gone. UDP and serial report io::Error.
+
+Transports:
+  - Loopback: in-memory pair, lossless. For tests.
+  - FaultyTransport: wraps any transport and drops or corrupts the next N sent
+    frames. Corruption flips the last byte, which is inside the CRC, so the
+    receiver always sees a CRC failure. (An earlier version flipped the first
+    byte, which gave a version error. That was a bug and is fixed.)
+  - UdpTransport: std::net, non-blocking, one frame per datagram. Largest
+    datagram is 1035 bytes.
+  - SerialTransport (feature `serial`): serial2, with a 1 ms read timeout on
+    every platform. Windows clamps timeouts to at least 1 ms, so 1 ms is used
+    everywhere to keep behaviour identical.
+  - CAN: planned. See section 10 and section 13.
+
+6. Link: sequencing and loss
+
+Link wraps a transport and adds:
+  - outgoing sequence numbers, starting at 0 and wrapping at 2^32
+  - counters: sent, received, crc_errors, malformed, lost
+  - loss detection from forward gaps in the sequence
+
+Loss rules:
+  - A forward gap of n counts n lost frames. A gap of 0 is a repeat and is
+    ignored. A backward jump (gap >= 2^31) is treated as reordering or a
+    duplicate and is ignored. This handles wraparound correctly.
+  - Loss is only detectable after the first frame has arrived. Before that, the
+    receiver has no expected sequence number. Frames lost before the first
+    arrival are not counted. This is a known limitation, documented on Link.
+  - Damaged frames are counted (crc_errors or malformed) and dropped. Their
+    sequence numbers are lost along with them, so a damaged frame shows up as
+    one lost frame on the next good arrival.
+
+7. Heartbeat
+
+Heartbeat records the time of each received frame, supplied by the caller. The
+link is alive if a frame arrived within `timeout_us` before the query time.
+Before the first frame the link is not alive. The heartbeat carries no payload
+of its own. Peers keep the link alive by sending any frame. A dedicated
+heartbeat message can be added in a higher layer.
+
+8. Reconnect policy
+
+Backoff returns the wait before each retry. The first wait is `initial_us`, and
+each later wait doubles, capped at `max_us`. The shift is capped, so long
+outages never overflow.
+
+Reconnector drives reconnection:
+  - on_link_down(now): the link is down. The first attempt is immediate.
+  - tick(now): returns Attempt when it is time to try. After an attempt, the next
+    one is scheduled by the backoff. It returns Wait otherwise.
+  - on_connected(): the link is up. Attempts stop, and the backoff resets for
+    the next outage.
+
+Recommended defaults (chosen for tpt-hands, not fixed by this spec): initial
+100 ms, cap 5 s. Callers set their own.
+
+Reconnector does not touch the transport. The caller opens it, and reports the
+result. The same policy serves every transport.
+
+9. Feature matrix
+
+  feature    enables                                              depends on
+  (none)     frame (no_std core, decode only)                     core
+  alloc      frame encoding                                       alloc
+  std        Link, Heartbeat, Reconnect, fragmentation, stream,   alloc
+             transports (Loopback, Fault, UDP)
+  serial     SerialTransport                                      std, serial2
+
+The `std` feature is default. The MCU firmware uses the core with no features.
+
+10. Fragmentation (for CAN and other small-MTU transports)
+
+A message larger than the transport's MTU is split into fragments. Each fragment
+carries a 3-byte header and then data:
+
+  byte 0  message id (u8). Tells interleaved messages apart.
+  byte 1  fragment index, from 0.
+  byte 2  fragment count minus one. A message has 1 to 256 fragments.
+
+  Data per fragment = MTU - 3. Classic CAN (MTU 8) carries 5 bytes of data.
+  CAN-FD (MTU 64) carries 61. A 1024-byte payload needs 205 classic fragments,
+  which fits within 256. The largest message at classic MTU is 1280 bytes.
+
+Reassembly:
+  - Fragments may arrive in any order. Repeats are ignored.
+  - Interleaved messages with different ids are kept apart.
+  - A fragment whose count differs from the partial message's count replaces
+    that partial: the id was reused.
+  - Partial messages expire `timeout_us` after their first fragment. expire()
+    removes them and returns the number dropped, so memory cannot grow without
+    bound.
+  - A repeat of a fragment that arrives after the message completed starts a new
+    partial that only expire() clears. It never produces a second message.
+
+Decision: classic CAN is the baseline. CAN-FD is the same code with MTU 64.
+
+11. Versioning and compatibility
+
+  - The frame version is 1. A change to the frame layout requires a new version
+    number, and receivers must reject versions they do not know.
+  - Once a version is released, its layout does not change.
+  - Crate versions follow semver. Breaking changes to the public API bump the
+    minor version while below 1.0.0.
+  - The fragment header is not versioned separately. A change to it is a frame
+    version change, because fragments travel inside frames.
+
+12. Testing
+
+  - Unit tests for every codec and state machine.
+  - Exhaustive single-bit-flip test: every single-bit change to a frame is
+    detected.
+  - Truncation test: every prefix of a frame is rejected.
+  - Loopback integration tests: ordering, loss, corruption, disconnect,
+    heartbeat, sequence wraparound.
+  - UDP integration tests over localhost.
+  - Serial: the open-error path only. A real port round trip needs a bench.
+  - Doc tests on the main public types and functions. Not every item has one yet.
+  - no_std builds for the MCU targets (thumbv7em-none-eabihf,
+    riscv32imc-unknown-none-elf). These are checked by hand so far. CI is
+    planned: this repo has none yet.
+
+13. Open items
+
+  1. Schema ownership. DESIGN.md (tpt-hands) assigns the protobuf schema to
+     tpt-link. The real tpt-link schema is not available to the tpt-hands
+     developers. The draft in tpt-hands/proto is provisional and must be
+     reconciled with the real schema once it is found or recreated here.
+  2. Serial round trip on real hardware.
+  3. CAN transport: SocketCAN (Linux) and a Windows adapter. Both need a licence
+     check first.
+  4. Deframer timeout for corrupted length fields (section 4).
+  5. Reconnect is not yet wired to a live transport in any consumer.
+  6. Go implementation. tpt-link is Rust-only. A Go wire package is needed by
+     tpt-swarm's Go services, and would be a separate module.
+  7. Hosting. This repo exists locally. It has not been pushed anywhere.
+  8. Security layer above the link (signed handshakes, replay protection) is
+     Phase 3 work in tpt-hands and is not specified here.
+
+14. Licence and dependency policy
+
+Permissive dependencies only: MIT, BSD-2/3-Clause, ISC, Zlib, Unicode, or MIT OR
+Apache-2.0. No Apache-2.0-only crates. `serialport` is MPL-2.0 and is not used.
+The `serial` feature uses `serial2` (BSD-2-Clause OR Apache-2.0), which is the
+only optional dependency. `cargo deny` enforces this policy.

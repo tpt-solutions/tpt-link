@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) 2026 TPT Solutions
+#
+# cargo-deny policy. Run with: cargo deny check
+#
+# Apache-2.0 on its own is not in the allow list, so any crate that is only
+# Apache-2.0 fails the licence check. Dual "MIT OR Apache-2.0" crates pass
+# because the MIT option is allowed.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+allow = [
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# prost is Apache-2.0 only. The whole prost family is banned so it cannot
+# enter the tree through tonic-build or a transitive dependency.
+deny = [
+    { crate = "prost" },
+    { crate = "prost-build" },
+    { crate = "prost-derive" },
+    { crate = "prost-types" },
+    { crate = "tonic-prost" },
+    { crate = "tonic-prost-build" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

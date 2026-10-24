@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) 2026 TPT Solutions
+
+[package]
+name = "tpt-link"
+description = "Shared wire layer for the TPT ecosystem: frame format, transports, sequencing, heartbeat and reconnect"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+authors = ["TPT Solutions"]
+publish = false
+
+[features]
+# Default: everything, including the transports.
+default = ["std"]
+# Frame encoding needs a heap buffer.
+alloc = []
+# Transports, Link, heartbeat, reconnect and fragmentation. Implies alloc.
+std = ["alloc"]
+# Serial and USB-CDC transport. serial2 is BSD-2-Clause OR Apache-2.0.
+serial = ["std", "dep:serial2"]
+
+[dependencies]
+serial2 = { version = "0.2.38", optional = true }

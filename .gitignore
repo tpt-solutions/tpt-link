@@ -1,0 +1,33 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Go
+/go/**/bin/
+*.test
+*.out
+
+# Firmware / embedded
+*.elf
+*.bin
+*.hex
+*.map
+
+# Python / sim tooling
+__pycache__/
+*.pyc
+.venv/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Env / secrets (signing keys must never be committed)
+.env
+*.pem
+*.key
+*.secret
