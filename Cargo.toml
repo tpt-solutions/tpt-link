@@ -31,3 +31,7 @@ micropb = { version = "0.6", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 socketcan = { version = "4", default-features = false, optional = true }
+
+[[example]]
+name = "schema_roundtrip"
+required-features = ["proto"]
