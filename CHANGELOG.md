@@ -44,7 +44,9 @@ changes bump the minor version.
 
 ### Added
 - `auth::Authenticated` (feature `auth`): seals every frame with ChaCha20-Poly1305 and
-  drops frames that do not open. Control messages carry an HMAC-SHA256 tag. The receiver issues a random nonce per
+  drops frames that do not open. Control messages carry an HMAC-SHA256 tag. Keys
+  carry a one-byte id. `install_key`, `activate_key` and `retire_key` rotate them
+  (up to four keys held at once). The receiver issues a random nonce per
   session, and frames verify only under it, so frames from an earlier session and
   repeats within the session are refused. A receiver that restarts sends a resync,
   so the sender recovers without a manual `renew`. Payloads are encrypted. Example:

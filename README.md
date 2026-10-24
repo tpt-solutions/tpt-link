@@ -94,7 +94,11 @@ cannot verify triggers a resync, and the sender begins a new session. That frame
 and any sent before the resync arrives are lost, so use a `reliable::Channel` above
 it if loss matters.
 
-Limits: keys are shared and not rotated, and frame sizes and timing are visible. See the
+Keys are identified by a one-byte id, and each message carries it. To rotate,
+install the new key under a new id on both ends, activate it on both, then retire
+the old id. Keys are still shared out of band, and there is no key exchange.
+
+Limits: keys are shared out of band, and frame sizes and timing are visible. See the
 `auth` module docs before relying on it.
 
 ## Troubleshooting
