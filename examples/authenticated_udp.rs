@@ -42,12 +42,13 @@ fn main() {
     let mut host = Link::new(Authenticated::new(host_transport, key));
     host.send(b"open valve 40%").unwrap();
 
-    // Localhost delivers in order, but give the datagrams a moment to land.
-    thread::sleep(Duration::from_millis(50));
+    // The session takes a round trip: the controller answers the host's hello,
+    // and the host then sends the queued command. Both sides must keep polling.
     let deadline = Instant::now() + Duration::from_secs(1);
     let mut accepted = Vec::new();
     while accepted.is_empty() && Instant::now() < deadline {
-        accepted.extend(controller.poll().expect("poll"));
+        host.poll().expect("poll host");
+        accepted.extend(controller.poll().expect("poll controller"));
         thread::sleep(Duration::from_millis(5));
     }
 
