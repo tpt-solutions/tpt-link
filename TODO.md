@@ -72,7 +72,7 @@ Legend: [x] done, [ ] to do. Section numbers refer to spec.txt.
 - [x] Link::poll keeps payloads already received when the transport then errors; the error is reported on the next poll (src/link.rs). Tested in tests/loopback.rs
 - [x] Link::poll decodes every frame in a datagram, not only the first. Tested in tests/loopback.rs
 - [x] Reordered or duplicate frames no longer cause false loss; duplicates are dropped and counted (window of 64); a large backward jump resyncs as a peer restart. Tested in tests/loopback.rs
-- [x] Reconnector::on_link_down is idempotent while down; Backoff::new(0, _) raised to 1 us. Still open: optional jitter and max attempts
+- [x] Reconnector::on_link_down is idempotent while down; Backoff::new(0, _) raised to 1 us; seeded jitter (Backoff::with_jitter) and an attempt limit with GiveUp (Reconnector::with_max_attempts)
 - [x] Deframer: buffer capped (MAX_BUFFER, overflowed counter), linear-time scan, table-driven CRC-32. Still open: stall clock resets on every discarded byte, push/push_at timing consistency
 - [x] Fragment/CAN reassembly: a conflicting fragment (different count or data) replaces a stale partial, with `replaced`/`expired` counters; sender masked to 3 bits; MTU validated in CanTransport::new
 - [x] SocketCAN: `CanBus::max_data_len` makes CanTransport::new reject an FD MTU on a classic-only bus (`MtuTooLarge`); recv loop bounded; Interrupted handled. NOT compiled here (Linux only), so CI must confirm. Still open: CAN filters, FD sockets, surfacing error frames

@@ -6,6 +6,8 @@ changes bump the minor version.
 ## Unreleased
 
 ### Changed (breaking)
+- `reconnect::Action` has a new `GiveUp` variant, returned once an outage uses up its
+  attempt limit. Exhaustive matches on `Action` need an arm for it.
 - `frame::FrameError::BadCrc` fields are now `carried` and `computed` (they were
   `expected` and `actual`, which read the wrong way round).
 - `LinkStats` has a new `bad_version` counter. Frames with an unknown version
@@ -36,6 +38,7 @@ changes bump the minor version.
 - `VirtualBus` no longer panics on a poisoned lock.
 
 ### Added
+- `Reconnector::with_max_attempts`, `gave_up`, `restart` and `with_backoff`. `Backoff::with_jitter` shortens waits by a seeded random share.
 - `FaultyTransport`: `corrupt_version_next`, `truncate_next`, `duplicate_next`,
   `reorder_next` (with `release_held`), and seeded `random_loss`. Random loss
   repeats for the same seed, so a failing test can be replayed.
