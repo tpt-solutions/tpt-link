@@ -46,7 +46,8 @@ changes bump the minor version.
 - `auth::Authenticated` (feature `auth`): appends a 16-byte HMAC-SHA256 tag to every
   frame and drops frames that do not verify. The receiver issues a random nonce per
   session, and frames verify only under it, so frames from an earlier session and
-  repeats within the session are refused. It gives no confidentiality. Example:
+  repeats within the session are refused. A receiver that restarts sends a resync,
+  so the sender recovers without a manual `renew`. It gives no confidentiality. Example:
   `authenticated_udp`.
 - `reliable::Channel`: acknowledged delivery over a `Transport`. Each message gets an
   id, every copy is acknowledged, and unacknowledged messages are sent again after

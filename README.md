@@ -88,9 +88,13 @@ Replays are refused too. The receiver issues a random nonce to each session, and
 frames verify only under that nonce, so a recording from an earlier session fails.
 Within a session, repeats and frames too far back to check are refused.
 
-Limits: payloads are not encrypted, keys are shared and not rotated, and after a
-restart either side needs `renew()` on the sender before frames flow again. See
-the `auth` module docs before relying on it.
+Restarts recover on their own. When the receiver restarts, the first frame it
+cannot verify triggers a resync, and the sender begins a new session. That frame
+and any sent before the resync arrives are lost, so use a `reliable::Channel` above
+it if loss matters.
+
+Limits: payloads are not encrypted, and keys are shared and not rotated. See the
+`auth` module docs before relying on it.
 
 ## Troubleshooting
 
