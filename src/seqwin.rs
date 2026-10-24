@@ -44,6 +44,8 @@ impl SeqWindow {
 
     /// Like `accept`, but a number far behind the window is `Stale` and the
     /// window is not restarted. For use where a replayed number must be refused.
+    /// Only the `auth` feature calls this, so the default build allows it unused.
+    #[cfg_attr(not(feature = "auth"), allow(dead_code))]
     pub(crate) fn arrive_strict(&mut self, seq: u32) -> Arrival {
         self.arrive(seq, false)
     }
