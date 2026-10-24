@@ -80,13 +80,17 @@ cargo run --bin tpt-link-cli -- crc 123456789         # 0xcbf43926
 ## Authentication
 
 The CRC only catches damage. On UDP or CAN, anyone who can reach the port or the
-bus can forge frames. Wrap the transport in `auth::Authenticated` to append a
-16-byte HMAC-SHA256 tag, keyed with a 32-byte shared secret. Forged or altered
-frames are dropped and counted before they reach the link.
+bus can forge frames. Wrap the transport in `auth::Authenticated` and every frame
+carries a 16-byte HMAC-SHA256 tag, keyed with a 32-byte shared secret. Forged or
+altered frames are dropped and counted before they reach the link.
 
-It does not encrypt payloads, and it does not stop replay: a recorded frame still
-verifies, and the link only drops it while its sequence number is in the window.
-Keys are shared and not rotated. See the `auth` module docs before relying on it.
+Replays are refused too. The receiver issues a random nonce to each session, and
+frames verify only under that nonce, so a recording from an earlier session fails.
+Within a session, repeats and frames too far back to check are refused.
+
+Limits: payloads are not encrypted, keys are shared and not rotated, and after a
+restart either side needs `renew()` on the sender before frames flow again. See
+the `auth` module docs before relying on it.
 
 ## Troubleshooting
 
