@@ -86,7 +86,8 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo run --manifest-path tools/gen-schema/Cargo.toml
       - name: Fail if regenerating changed src/schema.rs
-        run: git diff --exit-code -- src/schema.rs
+        # Catches edits to the tracked file and a regenerated file that is untracked.
+        run: test -z "$(git status --porcelain -- src/schema.rs)"
 
   docs:
     name: cargo doc with warnings denied
@@ -146,7 +147,6 @@ jobs:
   deny:
     name: cargo deny
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
