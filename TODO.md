@@ -88,7 +88,7 @@ Legend: [x] done, [ ] to do. Section numbers refer to spec.txt.
 - [ ] Driver helper combining Session + Reconnector (what examples/reconnect.rs does by hand); Session already covers Link + Heartbeat
 - [x] Richer FaultyTransport: reorder (with release_held), duplicate, truncate, version corruption, seeded random loss. Still open: latency and jitter
 - [ ] tokio adapter feature; tracing or defmt feature
-- [ ] tpt-link-cli: decode hex, listen on UDP/serial/CAN, send, bridge, record/replay
+- [x] tpt-link-cli: encode, decode and crc, offline (src/bin/tpt-link-cli.rs). Still open: listen on UDP/serial/CAN, send, bridge, record/replay
 - [ ] Wireshark Lua dissector for the frame format
 - [x] Randomised robustness tests (tests/robustness.rs): decode invariants, noisy-stream recovery, lost-fragment splices over CAN. Still open: cargo-fuzz targets and proptest round trips (needs a nightly toolchain or new dependencies)
 - [ ] Golden test vectors file (testdata/vectors.json); C header or Python binding

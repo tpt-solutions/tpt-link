@@ -42,6 +42,17 @@ Each runs with no hardware: `cargo run --example <name>`.
 | `reconnect` | `Reconnector` and `Heartbeat` keeping a UDP link up |
 | `schema_roundtrip` | A protobuf `Ack` inside a frame (`--features proto`) |
 
+## Command-line helper
+
+`tpt-link-cli` works offline, which is useful for frames copied out of a log or
+a serial terminal:
+
+```sh
+cargo run --bin tpt-link-cli -- encode 3 "hi there"   # prints the frame as hex
+cargo run --bin tpt-link-cli -- decode 0100000003...  # prints seq and payload, or the CRC error
+cargo run --bin tpt-link-cli -- crc 123456789         # 0xcbf43926
+```
+
 ## Choosing a transport
 
 | Transport | Use it for | Feature | Notes |

@@ -39,6 +39,8 @@ changes bump the minor version.
 - `VirtualBus` no longer panics on a poisoned lock.
 
 ### Added
+- `tpt-link-cli`: `encode`, `decode` and `crc` for frames, offline. Needs the std feature.
+- Randomised robustness tests (tests/robustness.rs), fixed seed.
 - `Reconnector::with_max_attempts`, `gave_up`, `restart` and `with_backoff`. `Backoff::with_jitter` shortens waits by a seeded random share.
 - `FaultyTransport`: `corrupt_version_next`, `truncate_next`, `duplicate_next`,
   `reorder_next` (with `release_held`), and seeded `random_loss`. Random loss
