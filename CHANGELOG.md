@@ -43,6 +43,8 @@ changes bump the minor version.
   Exhaustive matches need an arm for it.
 
 ### Added
+- `docs/auth-threat-model.md`: threat model and review questions for `auth`.
+- Keys and ephemeral secrets are wiped on drop (zeroize). Compiler copies are not.
 - `auth::Authenticated` (feature `auth`): seals every frame with ChaCha20-Poly1305 and
   drops frames that do not open. Each session runs an X25519 exchange authenticated
   with a pre-shared key, and data is sealed under the derived session key, so the
