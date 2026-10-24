@@ -19,6 +19,8 @@ pub struct LinkStats {
     pub received: u64,
     /// Frames that failed the CRC check.
     pub crc_errors: u64,
+    /// Frames with a version this build does not understand.
+    pub bad_version: u64,
     /// Frames that could not be parsed for any other reason.
     pub malformed: u64,
     /// Frames the peer sent that never arrived, found from sequence gaps.
@@ -71,12 +73,17 @@ impl<E: std::error::Error + 'static> std::error::Error for LinkError<E> {
 /// assert_eq!(b.poll().unwrap(), vec![b"hello".to_vec()]);
 /// ```
 #[derive(Debug)]
-pub struct Link<T> {
+pub struct Link<T: Transport> {
     transport: T,
     next_seq: u32,
     expected_seq: Option<u32>,
+    pending_error: Option<T::Error>,
     stats: LinkStats,
 }
+
+/// How far back a sequence number may step and still count as a reordered or
+/// duplicate frame rather than a peer restart.
+const REORDER_WINDOW: u32 = 64;
 
 impl<T: Transport> Link<T> {
     /// Wraps a transport.
@@ -85,6 +92,7 @@ impl<T: Transport> Link<T> {
             transport,
             next_seq: 0,
             expected_seq: None,
+            pending_error: None,
             stats: LinkStats::default(),
         }
     }
@@ -131,17 +139,47 @@ impl<T: Transport> Link<T> {
     }
 
     /// Returns every valid payload that has arrived, in order. Never blocks.
+    ///
+    /// If the transport fails after some payloads were already received, those
+    /// payloads are returned first and the error is reported by the next call.
+    /// A datagram holding several frames yields all of them.
     pub fn poll(&mut self) -> Result<Vec<Vec<u8>>, LinkError<T::Error>> {
+        if let Some(e) = self.pending_error.take() {
+            return Err(LinkError::Transport(e));
+        }
         let mut payloads = Vec::new();
-        while let Some(bytes) = self.transport.try_recv().map_err(LinkError::Transport)? {
-            match frame::decode(&bytes) {
-                Ok((decoded, _)) => {
-                    self.note_sequence(decoded.seq);
-                    self.stats.received += 1;
-                    payloads.push(decoded.payload.to_vec());
+        loop {
+            let bytes = match self.transport.try_recv() {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => break,
+                Err(e) if payloads.is_empty() => return Err(LinkError::Transport(e)),
+                Err(e) => {
+                    self.pending_error = Some(e);
+                    break;
                 }
-                Err(FrameError::BadCrc { .. }) => self.stats.crc_errors += 1,
-                Err(_) => self.stats.malformed += 1,
+            };
+            let mut rest = &bytes[..];
+            while !rest.is_empty() {
+                match frame::decode(rest) {
+                    Ok((decoded, used)) => {
+                        self.note_sequence(decoded.seq);
+                        self.stats.received += 1;
+                        payloads.push(decoded.payload.to_vec());
+                        rest = &rest[used..];
+                    }
+                    Err(FrameError::BadCrc { .. }) => {
+                        self.stats.crc_errors += 1;
+                        break;
+                    }
+                    Err(FrameError::BadVersion(_)) => {
+                        self.stats.bad_version += 1;
+                        break;
+                    }
+                    Err(_) => {
+                        self.stats.malformed += 1;
+                        break;
+                    }
+                }
             }
         }
         Ok(payloads)
@@ -167,15 +205,23 @@ impl<T: Transport> Link<T> {
 
     fn note_sequence(&mut self, seq: u32) {
         if let Some(expected) = self.expected_seq {
-            // A forward gap counts as loss. A backward jump (a duplicate or a
-            // reordered frame) is ignored. The threshold is half the sequence
-            // space, so wraparound is handled.
+            // A forward gap counts as loss. A small backward step (a duplicate
+            // or a reordered frame) is ignored and does not move the expected
+            // number, so the frames after it are not counted as lost. A large
+            // backward jump is taken as a peer restart and resyncs. The
+            // threshold is half the sequence space, so wraparound is handled.
             let gap = seq.wrapping_sub(expected);
-            if gap != 0 && gap < 0x8000_0000 {
+            if gap == 0 {
+                self.expected_seq = Some(seq.wrapping_add(1));
+            } else if gap < 0x8000_0000 {
                 self.stats.lost += u64::from(gap);
+                self.expected_seq = Some(seq.wrapping_add(1));
+            } else if expected.wrapping_sub(seq) > REORDER_WINDOW {
+                self.expected_seq = Some(seq.wrapping_add(1));
             }
+        } else {
+            self.expected_seq = Some(seq.wrapping_add(1));
         }
-        self.expected_seq = Some(seq.wrapping_add(1));
     }
 }
 

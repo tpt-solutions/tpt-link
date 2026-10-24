@@ -110,3 +110,84 @@ fn sequence_numbers_wrap_without_counting_false_loss() {
     assert_eq!(b.poll().unwrap().len(), 3);
     assert_eq!(b.stats().lost, 0);
 }
+
+fn raw_frame(seq: u32, payload: &[u8]) -> Vec<u8> {
+    let mut wire = Vec::new();
+    tpt_link::frame::encode(seq, payload, &mut wire).unwrap();
+    wire
+}
+
+#[test]
+fn payloads_survive_a_transport_error_that_follows_them() {
+    let (a, b) = Loopback::pair();
+    let mut a = Link::new(a);
+    let mut b = Link::new(b);
+    a.send(b"one").unwrap();
+    a.send(b"two").unwrap();
+    drop(a);
+
+    assert_eq!(b.poll().unwrap(), vec![b"one".to_vec(), b"two".to_vec()]);
+    assert!(matches!(b.poll(), Err(LinkError::Transport(Closed))));
+}
+
+#[test]
+fn every_frame_in_one_datagram_is_delivered() {
+    use tpt_link::Transport;
+
+    let (mut a, b) = Loopback::pair();
+    let mut b = Link::new(b);
+    let mut both = raw_frame(0, b"first");
+    both.extend(raw_frame(1, b"second"));
+    a.send(&both).unwrap();
+
+    assert_eq!(
+        b.poll().unwrap(),
+        vec![b"first".to_vec(), b"second".to_vec()]
+    );
+    assert_eq!(b.stats().received, 2);
+    assert_eq!(b.stats().lost, 0);
+}
+
+#[test]
+fn reordered_frame_is_not_counted_as_extra_loss() {
+    use tpt_link::Transport;
+
+    let (mut a, b) = Loopback::pair();
+    let mut b = Link::new(b);
+    for seq in [0, 2, 1, 3] {
+        a.send(&raw_frame(seq, b"x")).unwrap();
+    }
+
+    b.poll().unwrap();
+    // Frame 1 was only late, so the single gap seen at frame 2 is the whole count.
+    assert_eq!(b.stats().lost, 1);
+}
+
+#[test]
+fn peer_restart_resyncs_the_sequence() {
+    use tpt_link::Transport;
+
+    let (mut a, b) = Loopback::pair();
+    let mut b = Link::new(b);
+    for seq in [1000, 1001, 0, 1, 2] {
+        a.send(&raw_frame(seq, b"x")).unwrap();
+    }
+
+    assert_eq!(b.poll().unwrap().len(), 5);
+    assert_eq!(b.stats().lost, 0);
+}
+
+#[test]
+fn unknown_version_is_counted_separately_from_crc_errors() {
+    use tpt_link::Transport;
+
+    let (mut a, b) = Loopback::pair();
+    let mut b = Link::new(b);
+    let mut wire = raw_frame(0, b"x");
+    wire[0] = 9;
+    a.send(&wire).unwrap();
+
+    assert!(b.poll().unwrap().is_empty());
+    assert_eq!(b.stats().bad_version, 1);
+    assert_eq!(b.stats().crc_errors, 0);
+}
