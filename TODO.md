@@ -90,7 +90,7 @@ Legend: [x] done, [ ] to do. Section numbers refer to spec.txt.
 - [ ] tokio adapter feature; tracing or defmt feature
 - [ ] tpt-link-cli: decode hex, listen on UDP/serial/CAN, send, bridge, record/replay
 - [ ] Wireshark Lua dissector for the frame format
-- [ ] Fuzz targets (Deframer, frame::decode, Reassembler) and proptest round trips
+- [x] Randomised robustness tests (tests/robustness.rs): decode invariants, noisy-stream recovery, lost-fragment splices over CAN. Still open: cargo-fuzz targets and proptest round trips (needs a nightly toolchain or new dependencies)
 - [ ] Golden test vectors file (testdata/vectors.json); C header or Python binding
 
 ## I. Adoption

@@ -32,7 +32,8 @@ changes bump the minor version.
   calling it on every tick no longer defeats the backoff. A zero initial backoff
   is raised to 1 us.
 - `Reassembler` replaces a stale partial message when a fragment conflicts with it,
-  so a reused message id cannot splice two messages together.
+  when the new one disagrees with it. A reused id can still mix two messages
+  when nothing disagrees, so the link CRC above is what rejects the mix.
 - `CanTransport` masks the sender to 3 bits and rejects an MTU with no room for data.
 - `UdpTransport` no longer returns Windows `ConnectionReset` from `try_recv`.
 - `VirtualBus` no longer panics on a poisoned lock.

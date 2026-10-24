@@ -127,8 +127,11 @@ impl Partial {
 /// Message ids are one byte, so an id comes round again after 256 messages. A
 /// partial message is replaced, and counted in `replaced`, when a fragment
 /// disagrees with it: a different fragment count, or different data for an
-/// index already held. That is how a message that lost a fragment is told
-/// apart from the new message that reuses its id.
+/// index already held. A reused id is caught only when a new fragment disagrees
+/// with the old partial. If the old partial lacks an index that the new message
+/// fills in, the two can be mixed into one wrong message. The reassembler does
+/// not detect that, so the layer above must check integrity. `CanTransport`
+/// relies on the link CRC, which covers the whole payload.
 #[derive(Debug)]
 pub struct Reassembler {
     timeout_us: u64,
