@@ -3,15 +3,78 @@
 Shared wire layer for the TPT ecosystem: the frame format, transports, sequencing,
 heartbeat and reconnect policy. See [spec.txt](spec.txt) for the specification.
 
-## Use
+## Quickstart
 
 ```toml
 [dependencies]
-tpt-link = { path = "../tpt-link" }                      # full std build
-tpt-link = { path = "../tpt-link", default-features = false }  # no_std frame codec
+tpt-link = { git = "https://github.com/tpt-solutions/tpt-link", tag = "v0.2.0" }
+# Inside the TPT repos: tpt-link = { path = "../tpt-link" }
 ```
 
-Features: `std` (default), `alloc`, `serial`. See spec section 9.
+```rust
+use tpt_link::{Link, Loopback};
+
+let (a, b) = Loopback::pair();           // swap for UdpTransport, SerialTransport, CanTransport
+let (mut tx, mut rx) = (Link::new(a), Link::new(b));
+tx.send(b"hello")?;
+for payload in rx.poll()? {              // never blocks; damaged frames are counted and dropped
+    println!("{}", String::from_utf8_lossy(&payload));
+}
+println!("{:?}", rx.stats());            // received, lost, crc_errors, ...
+```
+
+Minimum supported Rust version: 1.85, except for the `proto` feature, which
+needs 1.88 because micropb does. The git dependency needs the `v0.2.0` tag
+to be pushed first.
+
+## Examples
+
+Each runs with no hardware: `cargo run --example <name>`.
+
+| Example | Shows |
+| --- | --- |
+| `loopback_hello` | The smallest send and receive |
+| `udp_echo` | A client and an echo server over UDP |
+| `fault_injection` | How drops and corruption show up in `LinkStats` |
+| `heartbeat_monitor` | Declaring a silent peer dead, with injected time |
+| `can_fragment` | A 600-byte frame over classic CAN, on a virtual bus |
+| `session` | Typed messages, automatic heartbeats and liveness (`envelope::Session`) |
+| `reconnect` | `Reconnector` and `Heartbeat` keeping a UDP link up |
+| `schema_roundtrip` | A protobuf `Ack` inside a frame (`--features proto`) |
+
+## Choosing a transport
+
+| Transport | Use it for | Feature | Notes |
+| --- | --- | --- | --- |
+| `UdpTransport` | Networks, host to host | default | Drops datagrams from any address but the peer |
+| `SerialTransport` | UART, USB-CDC | `serial` | Uses the deframer with a 500 ms stall timeout |
+| `CanTransport` | CAN and CAN FD buses | default | Fragments frames; needs a `CanBus` |
+| `SocketCanBus` | Linux SocketCAN | `can-socketcan` | Classic CAN only for now |
+| `Loopback`, `FaultyTransport` | Tests | default | In memory |
+
+## Features
+
+| Feature | Adds |
+| --- | --- |
+| `std` (default) | Transports, `Link`, heartbeat, reconnect, fragmentation |
+| `alloc` | Frame encoding without `std` |
+| none | `no_std` frame decoder |
+| `serial` | `SerialTransport` |
+| `can-socketcan` | `SocketCanBus` (Linux) |
+| `proto` | Protobuf core messages in `schema` |
+
+## Troubleshooting
+
+- **Serial port permission denied (Linux):** add your user to the `dialout`
+  group, then log in again.
+- **No CAN hardware:** use `VirtualBus`, or a virtual Linux interface:
+  `sudo modprobe vcan && sudo ip link add dev vcan0 type vcan && sudo ip link set up vcan0`.
+- **Windows CAN:** not supported yet, because the vendor runtimes fail the
+  licence policy (see TODO.md).
+- **Frames lost before the first one arrives are not counted:** the receiver has
+  no expected sequence number until it sees a frame.
+- **UDP frames never arrive:** the peer address must match the address the other
+  side sends from, including the IP, or the datagrams are dropped (see `foreign()`).
 
 ## Features in brief
 
@@ -22,6 +85,9 @@ Features: `std` (default), `alloc`, `serial`. See spec section 9.
   `serial`), and `FaultyTransport` for tests.
 - **Link**: sequence numbers, loss counts, a `Heartbeat` for liveness, and a
   `Reconnector` with exponential backoff. See `examples/reconnect.rs`.
+- **Messages**: an optional `envelope` layer puts a type byte (data, heartbeat,
+  ack, error) in the payload, and `Session` sends heartbeats and tracks liveness.
+  The frame format is unchanged, so a plain `Link` still interoperates.
 - **Fragmentation**: splits messages larger than a small MTU, and reassembles them
   with expiry (`fragment`).
 - **CAN**: `CanTransport` carries link frames over any `CanBus`. `SocketCanBus`
@@ -36,7 +102,7 @@ Features: `std` (default), `alloc`, `serial`. See spec section 9.
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo test --features serial
-cargo run --example reconnect
+cargo run --example reconnect   # and the other examples
 cargo test --features proto
 cargo test --features can-socketcan --test socketcan   # Linux, needs vcan0
 cargo deny check licenses bans sources advisories
