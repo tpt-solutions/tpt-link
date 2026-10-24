@@ -40,14 +40,29 @@ pub const MAX_PAYLOAD_LEN: usize = 1024;
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFF_u32;
     for &byte in data {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
+        crc = CRC_TABLE[usize::from((crc as u8) ^ byte)] ^ (crc >> 8);
     }
     !crc
 }
+
+/// Byte-at-a-time lookup table for the reflected polynomial 0xEDB88320. It is
+/// built at compile time and costs 1 KiB of read-only data.
+const CRC_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
 
 /// Why a frame could not be encoded or decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,9 +76,9 @@ pub enum FrameError {
     /// The CRC in the frame does not match the bytes received.
     BadCrc {
         /// CRC carried in the frame.
-        expected: u32,
+        carried: u32,
         /// CRC computed over the received bytes.
-        actual: u32,
+        computed: u32,
     },
 }
 
@@ -73,10 +88,10 @@ impl fmt::Display for FrameError {
             Self::Truncated => write!(f, "frame is truncated"),
             Self::BadVersion(v) => write!(f, "unsupported frame version {v}"),
             Self::TooLarge(len) => write!(f, "payload of {len} bytes exceeds {MAX_PAYLOAD_LEN}"),
-            Self::BadCrc { expected, actual } => {
+            Self::BadCrc { carried, computed } => {
                 write!(
                     f,
-                    "CRC mismatch: frame has {expected:#010x}, computed {actual:#010x}"
+                    "CRC mismatch: frame has {carried:#010x}, computed {computed:#010x}"
                 )
             }
         }
@@ -148,15 +163,15 @@ pub fn decode(buf: &[u8]) -> Result<(Frame<'_>, usize), FrameError> {
         return Err(FrameError::Truncated);
     }
 
-    let expected = u32::from_le_bytes([
+    let carried = u32::from_le_bytes([
         buf[body_end],
         buf[body_end + 1],
         buf[body_end + 2],
         buf[body_end + 3],
     ]);
-    let actual = crc32(&buf[..body_end]);
-    if expected != actual {
-        return Err(FrameError::BadCrc { expected, actual });
+    let computed = crc32(&buf[..body_end]);
+    if carried != computed {
+        return Err(FrameError::BadCrc { carried, computed });
     }
 
     Ok((
@@ -168,7 +183,7 @@ pub fn decode(buf: &[u8]) -> Result<(Frame<'_>, usize), FrameError> {
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
 

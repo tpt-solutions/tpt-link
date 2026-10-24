@@ -17,6 +17,9 @@
 
 use crate::frame::{CRC_LEN, HEADER_LEN, MAX_PAYLOAD_LEN, VERSION, crc32};
 
+/// Most bytes a `Deframer` holds at once: 64 maximum-size frames.
+pub const MAX_BUFFER: usize = 64 * (HEADER_LEN + MAX_PAYLOAD_LEN + CRC_LEN);
+
 /// Accumulates bytes and yields whole, CRC-valid frames.
 ///
 /// ```
@@ -63,6 +66,7 @@ pub struct Deframer {
     /// Time of the most recent byte received, or of the most recent discard.
     last_activity_us: u64,
     timeouts: u64,
+    overflowed: u64,
 }
 
 impl Deframer {
@@ -82,8 +86,22 @@ impl Deframer {
     }
 
     /// Appends bytes received from the wire.
+    ///
+    /// The buffer is capped at `MAX_BUFFER` bytes. If a flood or a peer that
+    /// never completes a frame pushes it past that, the oldest bytes are
+    /// dropped and counted in `overflowed`.
     pub fn push(&mut self, bytes: &[u8]) {
         self.buf.extend_from_slice(bytes);
+        if self.buf.len() > MAX_BUFFER {
+            let excess = self.buf.len() - MAX_BUFFER;
+            self.buf.drain(..excess);
+            self.overflowed += excess as u64;
+        }
+    }
+
+    /// Number of bytes dropped because the buffer reached `MAX_BUFFER`.
+    pub fn overflowed(&self) -> u64 {
+        self.overflowed
     }
 
     /// Appends bytes received at `now_us`. The time is used by `next_frame_at`
@@ -107,7 +125,7 @@ impl Deframer {
             if self.buf.is_empty() || now_us.saturating_sub(self.last_activity_us) < timeout_us {
                 return None;
             }
-            self.buf.remove(0);
+            self.buf.drain(..1);
             self.timeouts += 1;
             self.last_activity_us = now_us;
         }
@@ -122,44 +140,48 @@ impl Deframer {
     /// CRC so that `frame::decode` can parse it. Returns `None` when more bytes
     /// are needed. This never applies the stall timeout.
     pub fn next_frame(&mut self) -> Option<Vec<u8>> {
-        loop {
-            if self.buf.first() != Some(&VERSION) {
-                // Not at a frame start. Scan forward one byte at a time.
-                if self.buf.is_empty() {
-                    return None;
-                }
-                self.buf.remove(0);
-                continue;
-            }
-            if self.buf.len() < HEADER_LEN {
-                return None;
+        // `start` is the candidate frame start. Bytes before it are garbage and
+        // are removed in one drain, so scanning noise is linear, not quadratic.
+        let mut start = 0;
+        let result = loop {
+            let Some(offset) = self.buf[start..].iter().position(|&b| b == VERSION) else {
+                start = self.buf.len();
+                break None;
+            };
+            start += offset;
+            let rest = &self.buf[start..];
+            if rest.len() < HEADER_LEN {
+                break None;
             }
 
-            let len = usize::from(u16::from_le_bytes([self.buf[5], self.buf[6]]));
+            let len = usize::from(u16::from_le_bytes([rest[5], rest[6]]));
             if len > MAX_PAYLOAD_LEN {
-                self.buf.remove(0);
+                start += 1;
                 continue;
             }
 
             let total = HEADER_LEN + len + CRC_LEN;
-            if self.buf.len() < total {
-                return None;
+            if rest.len() < total {
+                break None;
             }
 
             let body_end = total - CRC_LEN;
             let expected = u32::from_le_bytes([
-                self.buf[body_end],
-                self.buf[body_end + 1],
-                self.buf[body_end + 2],
-                self.buf[body_end + 3],
+                rest[body_end],
+                rest[body_end + 1],
+                rest[body_end + 2],
+                rest[body_end + 3],
             ]);
-            if crc32(&self.buf[..body_end]) == expected {
-                return Some(self.buf.drain(..total).collect());
+            if crc32(&rest[..body_end]) == expected {
+                break Some(rest[..total].to_vec());
             }
             // Bad CRC. This may not be a frame start at all, so move on by one
             // byte rather than skipping the whole claimed length.
-            self.buf.remove(0);
-        }
+            start += 1;
+        };
+        let consumed = start + result.as_ref().map_or(0, Vec::len);
+        self.buf.drain(..consumed);
+        result
     }
 
     /// Bytes buffered and not yet consumed.
@@ -306,6 +328,26 @@ mod tests {
             }
         }
         assert_eq!(d.timeouts(), 0);
+    }
+
+    #[test]
+    fn buffer_is_capped_and_overflow_counted() {
+        let mut d = Deframer::new();
+        // A header that claims a frame which never completes, then a flood.
+        d.push(&stalled_header());
+        d.push(&vec![0u8; MAX_BUFFER]);
+        assert_eq!(d.buffered(), MAX_BUFFER);
+        assert_eq!(d.overflowed(), HEADER_LEN as u64);
+    }
+
+    #[test]
+    fn long_noise_run_is_cleared_in_one_pass() {
+        let frame = wire_of(9, b"after a lot of noise");
+        let mut d = Deframer::new();
+        d.push(&vec![0xAAu8; 50_000]);
+        d.push(&frame);
+        assert_eq!(d.next_frame(), Some(frame));
+        assert_eq!(d.buffered(), 0);
     }
 
     #[test]

@@ -26,8 +26,11 @@ pub struct Backoff {
 }
 
 impl Backoff {
-    /// Creates a backoff. `max_us` is clamped to at least `initial_us`.
+    /// Creates a backoff. `initial_us` is raised to at least 1 so the schedule
+    /// never degenerates into a busy retry, and `max_us` is clamped to at
+    /// least `initial_us`.
     pub fn new(initial_us: u64, max_us: u64) -> Self {
+        let initial_us = initial_us.max(1);
         Self {
             initial_us,
             max_us: max_us.max(initial_us),
@@ -98,8 +101,13 @@ impl Reconnector {
     }
 
     /// Call when the heartbeat reports the link dead. Attempts resume with the
-    /// backoff schedule starting again.
+    /// backoff schedule starting again. Calling it while the link is already
+    /// down does nothing, so a caller may report the outage on every tick
+    /// without defeating the backoff.
     pub fn on_link_down(&mut self, now_us: u64) {
+        if !self.up {
+            return;
+        }
         self.up = false;
         self.backoff.reset();
         self.next_attempt_us = now_us;
@@ -164,6 +172,22 @@ mod tests {
         r.on_connected();
         assert!(r.is_up());
         assert_eq!(r.tick(u64::MAX), Action::Wait);
+    }
+
+    #[test]
+    fn repeated_link_down_does_not_reset_the_backoff() {
+        let mut r = Reconnector::new(100, 500);
+        r.on_link_down(0);
+        assert_eq!(r.tick(0), Action::Attempt);
+        r.on_link_down(50);
+        assert_eq!(r.tick(50), Action::Wait);
+        assert_eq!(r.tick(100), Action::Attempt);
+    }
+
+    #[test]
+    fn zero_initial_delay_is_not_a_busy_retry() {
+        let mut b = Backoff::new(0, 0);
+        assert_eq!(b.next_delay(), 1);
     }
 
     #[test]
