@@ -7,7 +7,7 @@
 use std::fmt;
 
 use crate::frame::{self, FrameError};
-
+use crate::seqwin::SeqWindow;
 use crate::transport::Transport;
 
 /// Counters kept by a `Link`.
@@ -82,18 +82,10 @@ impl<E: std::error::Error + 'static> std::error::Error for LinkError<E> {
 pub struct Link<T: Transport> {
     transport: T,
     next_seq: u32,
-    /// Highest sequence number received so far.
-    highest: Option<u32>,
-    /// Bit `n` is set when `highest - n` has arrived. One bit per number in the
-    /// window, so the window is `u64::BITS` wide.
-    seen: u64,
+    window: SeqWindow,
     pending_error: Option<T::Error>,
     stats: LinkStats,
 }
-
-/// How far behind the highest sequence number a frame may arrive and still be
-/// checked against the window. Anything further back is a peer restart.
-const WINDOW: u32 = u64::BITS;
 
 impl<T: Transport> Link<T> {
     /// Wraps a transport.
@@ -101,8 +93,7 @@ impl<T: Transport> Link<T> {
         Self {
             transport,
             next_seq: 0,
-            highest: None,
-            seen: 0,
+            window: SeqWindow::default(),
             pending_error: None,
             stats: LinkStats::default(),
         }
@@ -173,11 +164,13 @@ impl<T: Transport> Link<T> {
             while !rest.is_empty() {
                 match frame::decode(rest) {
                     Ok((decoded, used)) => {
-                        if self.note_sequence(decoded.seq) {
-                            self.stats.received += 1;
-                            payloads.push(decoded.payload.to_vec());
-                        } else {
-                            self.stats.duplicates += 1;
+                        match self.window.accept(decoded.seq) {
+                            Some(skipped) => {
+                                self.stats.lost += u64::from(skipped);
+                                self.stats.received += 1;
+                                payloads.push(decoded.payload.to_vec());
+                            }
+                            None => self.stats.duplicates += 1,
                         }
                         rest = &rest[used..];
                     }
@@ -215,52 +208,6 @@ impl<T: Transport> Link<T> {
     /// ```
     pub fn into_inner(self) -> T {
         self.transport
-    }
-
-    /// Records an arriving sequence number. Returns `true` if the frame is new
-    /// and should be delivered, and `false` for a duplicate.
-    fn note_sequence(&mut self, seq: u32) -> bool {
-        let Some(highest) = self.highest else {
-            self.highest = Some(seq);
-            self.seen = 1;
-            return true;
-        };
-
-        // Distances wrap, and the half of the sequence space above zero counts
-        // as ahead. This keeps wraparound working.
-        let ahead = seq.wrapping_sub(highest);
-        if ahead == 0 {
-            return false;
-        }
-        if ahead < 0x8000_0000 {
-            // The numbers between the old highest and this one are missing so
-            // far. A late arrival may still fill them in.
-            self.stats.lost += u64::from(ahead - 1);
-            self.seen = if ahead >= WINDOW {
-                0
-            } else {
-                self.seen << ahead
-            };
-            self.seen |= 1;
-            self.highest = Some(seq);
-            return true;
-        }
-
-        let behind = highest.wrapping_sub(seq);
-        if behind >= WINDOW {
-            // Too far back to be a late frame, so the peer has restarted.
-            self.seen = 1;
-            self.highest = Some(seq);
-            return true;
-        }
-        let bit = 1u64 << behind;
-        if self.seen & bit != 0 {
-            return false;
-        }
-        // A late frame that fills an earlier gap. It was already counted as
-        // lost, and it is not taken back out.
-        self.seen |= bit;
-        true
     }
 }
 

@@ -32,6 +32,8 @@ pub mod link;
 pub mod reconnect;
 #[cfg(feature = "std")]
 mod rng;
+#[cfg(feature = "std")]
+mod seqwin;
 #[cfg(feature = "serial")]
 pub mod serial;
 #[cfg(feature = "std")]

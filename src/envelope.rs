@@ -13,9 +13,11 @@
 //! | 1    | Heartbeat | empty                       |
 //! | 2    | Ack       | sequence number, u32 LE     |
 //! | 3    | Error     | error code, u32 LE          |
+//! | 4    | Reliable  | message id, u32 LE, then data |
 //!
 //! `Session` wraps a `Link` and uses the layer: it sends heartbeats on a
-//! schedule and treats every received message as a sign of life.
+//! schedule and treats every received message as a sign of life. `Channel` in
+//! `reliable` builds acknowledged delivery on top of the Reliable and Ack types.
 
 use std::fmt;
 
@@ -26,6 +28,7 @@ const TYPE_DATA: u8 = 0;
 const TYPE_HEARTBEAT: u8 = 1;
 const TYPE_ACK: u8 = 2;
 const TYPE_ERROR: u8 = 3;
+const TYPE_RELIABLE: u8 = 4;
 
 /// One message carried in a frame payload.
 ///
@@ -50,6 +53,14 @@ pub enum Message {
     Error {
         /// Application-defined error code.
         code: u32,
+    },
+    /// Data that the receiver should acknowledge with `Ack { seq: id }`. The
+    /// id is the sender's own counter, separate from the link sequence number.
+    Reliable {
+        /// Message id.
+        id: u32,
+        /// Application bytes.
+        data: Vec<u8>,
     },
 }
 
@@ -96,6 +107,11 @@ impl Message {
             Self::Heartbeat => vec![TYPE_HEARTBEAT],
             Self::Ack { seq } => tagged_u32(TYPE_ACK, *seq),
             Self::Error { code } => tagged_u32(TYPE_ERROR, *code),
+            Self::Reliable { id, data } => {
+                let mut out = tagged_u32(TYPE_RELIABLE, *id);
+                out.extend_from_slice(data);
+                out
+            }
         }
     }
 
@@ -117,6 +133,13 @@ impl Message {
             TYPE_HEARTBEAT => Err(bad_length()),
             TYPE_ACK => Ok(Self::Ack { seq: u32_body()? }),
             TYPE_ERROR => Ok(Self::Error { code: u32_body()? }),
+            TYPE_RELIABLE => match body.split_first_chunk::<4>() {
+                Some((id, data)) => Ok(Self::Reliable {
+                    id: u32::from_le_bytes(*id),
+                    data: data.to_vec(),
+                }),
+                None => Err(bad_length()),
+            },
             other => Err(EnvelopeError::UnknownType(other)),
         }
     }
@@ -259,6 +282,14 @@ mod tests {
             Message::Heartbeat,
             Message::Ack { seq: u32::MAX },
             Message::Error { code: 300 },
+            Message::Reliable {
+                id: 9,
+                data: b"reliable".to_vec(),
+            },
+            Message::Reliable {
+                id: 0,
+                data: vec![],
+            },
         ] {
             assert_eq!(Message::decode(&message.encode()).unwrap(), message);
         }
