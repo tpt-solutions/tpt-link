@@ -75,13 +75,14 @@ cargo run --bin tpt-link-cli -- crc 123456789         # 0xcbf43926
 | `serial` | `SerialTransport` |
 | `can-socketcan` | `SocketCanBus` (Linux) |
 | `proto` | Protobuf core messages in `schema` |
-| `auth` | `auth::Authenticated`: HMAC-SHA256 tag on every frame (see below) |
+| `auth` | `auth::Authenticated`: encrypted, authenticated frames (see below) |
 
 ## Authentication
 
 The CRC only catches damage. On UDP or CAN, anyone who can reach the port or the
 bus can forge frames. Wrap the transport in `auth::Authenticated` and every frame
-carries a 16-byte HMAC-SHA256 tag, keyed with a 32-byte shared secret. Forged or
+is encrypted and authenticated with ChaCha20-Poly1305, keyed with a 32-byte shared
+secret. Listeners cannot read the payloads, and forged or
 altered frames are dropped and counted before they reach the link.
 
 Replays are refused too. The receiver issues a random nonce to each session, and
@@ -93,7 +94,7 @@ cannot verify triggers a resync, and the sender begins a new session. That frame
 and any sent before the resync arrives are lost, so use a `reliable::Channel` above
 it if loss matters.
 
-Limits: payloads are not encrypted, and keys are shared and not rotated. See the
+Limits: keys are shared and not rotated, and frame sizes and timing are visible. See the
 `auth` module docs before relying on it.
 
 ## Troubleshooting
