@@ -57,5 +57,5 @@ fn main() {
     }
     let auth = controller.transport_mut();
     println!("dropped by the peer filter: {}", auth.inner_mut().foreign());
-    println!("dropped by the tag check: {}", auth.rejected());
+    println!("dropped by the authentication check: {}", auth.rejected());
 }

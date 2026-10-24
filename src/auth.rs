@@ -6,26 +6,29 @@
 //!
 //! The link CRC catches damage, but anyone who can reach the port or the bus
 //! can compute it, so it cannot tell a real frame from a forged one.
-//! `Authenticated` wraps a transport and tags every frame with the first 16
-//! bytes of HMAC-SHA256, keyed with a 32-byte shared key.
+//! `Authenticated` wraps a transport and seals every frame with
+//! ChaCha20-Poly1305, keyed with a 32-byte shared key. Control messages (hello,
+//! challenge and resync) carry a 16-byte HMAC-SHA256 tag instead, since they
+//! hide nothing.
 //!
 //! Replay is stopped by a session nonce, which the receiver chooses:
 //!
 //! 1. A sender with no session sends a signed *hello*, and queues its frames.
 //! 2. The receiver answers with a signed *challenge* holding a fresh random
 //!    nonce, and accepts data only under that nonce.
-//! 3. Every data tag covers the nonce and the frame. A frame recorded in an
-//!    earlier session fails once the receiver has issued a new nonce.
+//! 3. The session nonce is bound into every sealed frame as associated data.
+//!    A frame recorded in an earlier session fails once the receiver has
+//!    issued a new nonce.
 //! 4. Within a session, the sequence window refuses repeats, and refuses
 //!    numbers too far back to check, rather than treating them as a restart.
 //!
 //! What this gives: every frame that reaches the link was made by a holder of
 //! the key, for the session the receiver is in, and was not altered. A replay
-//! from an earlier session or from far back in this one is refused.
+//! from an earlier session or from far back in this one is refused. Payloads
+//! are encrypted, so a listener cannot read them.
 //!
 //! What it does not give:
 //!
-//! - **Confidentiality.** Payloads travel in the clear.
 //! - **Lossless restarts.** When the receiver restarts, it sends a resync for
 //!   the first frame it cannot verify, and the sender starts a new session. That
 //!   frame is lost, and so are frames sent before the resync arrives. A sender
@@ -35,10 +38,13 @@
 //!   new nonce, which ends the current session. That is denial of service, not
 //!   a way to inject frames.
 //! - **Key management.** The key is shared out of band and is not rotated.
+//! - **Traffic analysis.** Frame sizes and timing are visible.
 
 use std::collections::VecDeque;
 use std::fmt;
 
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -54,6 +60,8 @@ pub const KEY_LEN: usize = 32;
 pub const TAG_LEN: usize = 16;
 /// Bytes in a session nonce.
 pub const NONCE_LEN: usize = 16;
+/// Bytes in the random nonce sent with each data message.
+const MESSAGE_NONCE_LEN: usize = 12;
 
 /// First byte of a hello. It is not a frame version, so the two never clash.
 const TYPE_HELLO: u8 = 0xC0;
@@ -62,6 +70,9 @@ const TYPE_CHALLENGE: u8 = 0xC1;
 /// First byte of a resync. Sent by a receiver that has no session with the
 /// sender, which tells the sender to start one again with a hello.
 const TYPE_RESYNC: u8 = 0xC2;
+/// First byte of a data message. The frame inside is sealed, so it has no
+/// readable first byte, and this type byte keeps data apart from control.
+const TYPE_DATA: u8 = 0xD0;
 /// Frames held back while the session is being set up. The oldest are dropped
 /// beyond this.
 const MAX_PENDING: usize = 32;
@@ -179,7 +190,7 @@ impl<T> Authenticated<T> {
 /// Tag over `parts`, keyed with `key`. The key is always a valid HMAC key
 /// length, so this cannot fail.
 fn tag_over(key: &Key, parts: &[&[u8]]) -> [u8; TAG_LEN] {
-    let mut mac = HmacSha256::new_from_slice(&key.0).expect("HMAC accepts any key length");
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(&key.0).expect("HMAC accepts any key length");
     for part in parts {
         mac.update(part);
     }
@@ -191,7 +202,7 @@ fn tag_over(key: &Key, parts: &[&[u8]]) -> [u8; TAG_LEN] {
 
 /// True if `tag` is the tag of `parts` under `key`. Compared in constant time.
 fn verify_over(key: &Key, parts: &[&[u8]], tag: &[u8]) -> bool {
-    let mut mac = HmacSha256::new_from_slice(&key.0).expect("HMAC accepts any key length");
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(&key.0).expect("HMAC accepts any key length");
     for part in parts {
         mac.update(part);
     }
@@ -206,12 +217,49 @@ fn fresh_nonce() -> [u8; NONCE_LEN] {
     nonce
 }
 
-/// The bytes of a data message: the frame, then its tag over nonce and frame.
-fn data_wire(key: &Key, nonce: &[u8; NONCE_LEN], frame: &[u8]) -> Vec<u8> {
-    let mut wire = Vec::with_capacity(frame.len() + TAG_LEN);
-    wire.extend_from_slice(frame);
-    wire.extend_from_slice(&tag_over(key, &[nonce, frame]));
+/// A fresh random nonce for one data message. Random 96-bit nonces are safe for
+/// ChaCha20-Poly1305 at the message volumes a link carries.
+fn fresh_message_nonce() -> [u8; MESSAGE_NONCE_LEN] {
+    let mut nonce = [0u8; MESSAGE_NONCE_LEN];
+    getrandom::getrandom(&mut nonce).expect("the operating system random source is available");
+    nonce
+}
+
+/// A data message: its type byte, a fresh nonce, then the frame sealed with
+/// ChaCha20-Poly1305. The session nonce is bound in as associated data, so a
+/// message sealed in one session does not open in another.
+fn data_wire(key: &Key, session: &[u8; NONCE_LEN], frame: &[u8]) -> Vec<u8> {
+    let nonce = fresh_message_nonce();
+    let cipher = ChaCha20Poly1305::new_from_slice(&key.0).expect("the key is 32 bytes");
+    let sealed = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: frame,
+                aad: session,
+            },
+        )
+        .expect("sealing a frame cannot fail");
+    let mut wire = Vec::with_capacity(1 + MESSAGE_NONCE_LEN + sealed.len());
+    wire.push(TYPE_DATA);
+    wire.extend_from_slice(&nonce);
+    wire.extend_from_slice(&sealed);
     wire
+}
+
+/// Opens a sealed message. Returns `None` unless it was sealed under this key
+/// and session.
+fn open_data(key: &Key, session: &[u8; NONCE_LEN], nonce: &[u8], sealed: &[u8]) -> Option<Vec<u8>> {
+    let cipher = ChaCha20Poly1305::new_from_slice(&key.0).expect("the key is 32 bytes");
+    cipher
+        .decrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: sealed,
+                aad: session,
+            },
+        )
+        .ok()
 }
 
 impl<T: Transport> Authenticated<T> {
@@ -303,8 +351,9 @@ impl<T: Transport> Authenticated<T> {
         self.flush()
     }
 
-    /// Checks a data message. Returns the frame if it is new and authentic.
-    fn take_data(&mut self, wire: Vec<u8>) -> Result<Option<Vec<u8>>, T::Error> {
+    /// Opens a data message and checks it. Returns the frame if it is new and
+    /// authentic.
+    fn take_data(&mut self, wire: &[u8]) -> Result<Option<Vec<u8>>, T::Error> {
         let Some(issued) = self.issued.as_mut() else {
             // No session with this peer. A restart on our side is the usual
             // reason, so tell the sender to start again.
@@ -315,15 +364,16 @@ impl<T: Transport> Authenticated<T> {
             }
             return Ok(None);
         };
-        if wire.len() < TAG_LEN + HEADER_LEN {
+        let body = &wire[1..];
+        if body.len() < MESSAGE_NONCE_LEN + TAG_LEN + HEADER_LEN {
             self.rejected += 1;
             return Ok(None);
         }
-        let (frame, sent_tag) = wire.split_at(wire.len() - TAG_LEN);
-        if !verify_over(&self.key, &[&issued.nonce, frame], sent_tag) {
+        let (nonce, sealed) = body.split_at(MESSAGE_NONCE_LEN);
+        let Some(frame) = open_data(&self.key, &issued.nonce, nonce, sealed) else {
             self.rejected += 1;
             return Ok(None);
-        }
+        };
         if frame.first() != Some(&VERSION) {
             self.rejected += 1;
             return Ok(None);
@@ -332,7 +382,7 @@ impl<T: Transport> Authenticated<T> {
         match issued.window.arrive_strict(seq) {
             Arrival::New { .. } => {
                 issued.in_use = true;
-                Ok(Some(frame.to_vec()))
+                Ok(Some(frame))
             }
             Arrival::Repeat | Arrival::Stale => {
                 self.replayed += 1;
@@ -377,11 +427,12 @@ impl<T: Transport> Transport for Authenticated<T> {
                 Some(&TYPE_HELLO) => self.answer_hello(&wire)?,
                 Some(&TYPE_CHALLENGE) => self.take_challenge(&wire)?,
                 Some(&TYPE_RESYNC) => self.take_resync(&wire)?,
-                _ => {
-                    if let Some(frame) = self.take_data(wire)? {
+                Some(&TYPE_DATA) => {
+                    if let Some(frame) = self.take_data(&wire)? {
                         return Ok(Some(frame));
                     }
                 }
+                _ => self.rejected += 1,
             }
         }
     }
@@ -451,7 +502,7 @@ mod tests {
 
     fn data_wires(log: &[Vec<u8>]) -> Vec<Vec<u8>> {
         log.iter()
-            .filter(|w| w.first() == Some(&VERSION))
+            .filter(|w| w.first() == Some(&TYPE_DATA))
             .cloned()
             .collect()
     }
@@ -533,7 +584,8 @@ mod tests {
         deliver(&mut tx, &mut rx, &frame(0, b"open valve"));
 
         let mut tampered = data_wires(&tx.inner_mut().log)[0].clone();
-        tampered[8] ^= 0x01;
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
         tx.inner_mut().inner.send(&tampered).unwrap();
         assert_eq!(rx.try_recv().unwrap(), None);
         assert_eq!(rx.rejected(), 1);
@@ -592,6 +644,29 @@ mod tests {
     }
 
     #[test]
+    fn the_payload_is_not_readable_on_the_wire() {
+        let (a, b) = Loopback::pair();
+        let mut tx = Authenticated::new(recorder(a), key(1));
+        let mut rx = Authenticated::new(b, key(1));
+        let secret = b"open valve 100%";
+        deliver(&mut tx, &mut rx, &frame(0, secret));
+
+        let wires = data_wires(&tx.inner_mut().log);
+        assert_eq!(wires.len(), 1);
+        assert!(!wires[0].windows(secret.len()).any(|w| w == secret));
+    }
+
+    #[test]
+    fn sealing_the_same_frame_twice_gives_different_bytes() {
+        let session = [9; NONCE_LEN];
+        let f = frame(0, b"same");
+        assert_ne!(
+            data_wire(&key(1), &session, &f),
+            data_wire(&key(1), &session, &f)
+        );
+    }
+
+    #[test]
     fn a_restarted_receiver_recovers_without_renew() {
         let (a, b) = Loopback::pair();
         let mut tx = Authenticated::new(recorder(a), key(1));
@@ -621,7 +696,9 @@ mod tests {
         let mut tx = recorder(a);
         let mut rx = Authenticated::new(recorder(b), key(1));
         for seq in 0..3 {
-            tx.inner.send(&frame(seq, b"x")).unwrap();
+            tx.inner
+                .send(&data_wire(&key(1), &[0; NONCE_LEN], &frame(seq, b"x")))
+                .unwrap();
         }
         assert_eq!(rx.try_recv().unwrap(), None);
         assert_eq!(rx.rejected(), 3);
