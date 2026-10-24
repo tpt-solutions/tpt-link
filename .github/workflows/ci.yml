@@ -5,7 +5,17 @@ name: CI
 
 on:
   push:
+    branches: [master]
+    tags: ["v*"]
   pull_request:
+
+# A new push to the same branch or PR cancels the run it supersedes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,19 +24,23 @@ jobs:
   lint:
     name: fmt and clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       # rustup reads rust-toolchain.toml, so the pinned toolchain is installed.
       - run: rustup show
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --features serial -- -D warnings
       - run: cargo clippy --all-targets --features proto -- -D warnings
       - run: cargo clippy --lib --no-default-features -- -D warnings
+      - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
     name: test (${{ matrix.os }}, ${{ matrix.features }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -35,39 +49,95 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup show
+      - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets ${{ matrix.features }}
+
+  test-no-std-lib:
+    name: tests without std (the codec)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --lib --no-default-features
+      - run: cargo test --lib --no-default-features --features alloc
+
+  msrv:
+    name: MSRV 1.85 (default features and serial)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      # The `proto` feature needs 1.88 because micropb 0.6 does.
+      - run: rustup toolchain install 1.85 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +1.85 check --all-targets
+      - run: cargo +1.85 check --all-targets --features serial
+
+  schema:
+    name: generated schema is up to date
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: cargo run --manifest-path tools/gen-schema/Cargo.toml
+      - name: Fail if regenerating changed src/schema.rs
+        run: git diff --exit-code -- src/schema.rs
 
   docs:
     name: cargo doc with warnings denied
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - run: rustup show
+      - uses: Swatinem/rust-cache@v2
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 
   socketcan:
     name: SocketCAN over vcan0
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - run: rustup show
+      - uses: Swatinem/rust-cache@v2
       - name: Create virtual CAN interface
+        id: vcan
         run: |
-          sudo modprobe vcan
-          sudo ip link add dev vcan0 type vcan
-          sudo ip link set up vcan0
+          # The vcan module ships in linux-modules-extra, which the runner's
+          # Azure kernel does not install by default, and which can be missing
+          # from the apt mirror right after a runner kernel update.
+          if ! sudo modprobe vcan; then
+            sudo apt-get update
+            sudo apt-get install -y linux-modules-extra-$(uname -r) || true
+          fi
+          if sudo modprobe vcan; then
+            sudo ip link add dev vcan0 type vcan
+            sudo ip link set up vcan0
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::vcan is unavailable on this runner, so the SocketCAN test was skipped"
+          fi
       - run: cargo clippy --all-targets --features can-socketcan -- -D warnings
-      - run: cargo test --features can-socketcan --test socketcan
+      - if: steps.vcan.outputs.ready == 'true'
+        run: cargo test --features can-socketcan --test socketcan
 
   no-std:
     name: no_std build (${{ matrix.target }})
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       matrix:
         target: [thumbv7em-none-eabihf, riscv32imc-unknown-none-elf]
     steps:
       - uses: actions/checkout@v4
       - run: rustup show
+      - uses: Swatinem/rust-cache@v2
       - run: rustup target add ${{ matrix.target }}
       - run: cargo build --no-default-features --target ${{ matrix.target }}
       - run: cargo build --no-default-features --features alloc --target ${{ matrix.target }}
@@ -76,6 +146,8 @@ jobs:
   deny:
     name: cargo deny
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
