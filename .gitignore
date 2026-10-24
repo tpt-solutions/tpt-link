@@ -3,11 +3,6 @@
 **/*.rs.bk
 Cargo.lock.bak
 
-# Go
-/go/**/bin/
-*.test
-*.out
-
 # Firmware / embedded
 *.elf
 *.bin

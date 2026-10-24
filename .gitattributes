@@ -1,0 +1,12 @@
+* text=auto eol=lf
+*.rs text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.bin binary
+*.elf binary
+*.hex binary
+*.map binary
+*.wasm binary
