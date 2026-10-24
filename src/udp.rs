@@ -27,6 +27,7 @@ const MAX_DATAGRAM: usize = HEADER_LEN + MAX_PAYLOAD_LEN + CRC_LEN;
 pub struct UdpTransport {
     socket: UdpSocket,
     peer: SocketAddr,
+    foreign: u64,
 }
 
 impl UdpTransport {
@@ -35,7 +36,16 @@ impl UdpTransport {
     pub fn bind<A: std::net::ToSocketAddrs>(local: A, peer: SocketAddr) -> io::Result<Self> {
         let socket = UdpSocket::bind(local)?;
         socket.set_nonblocking(true)?;
-        Ok(Self { socket, peer })
+        Ok(Self {
+            socket,
+            peer,
+            foreign: 0,
+        })
+    }
+
+    /// Datagrams dropped because they came from an address other than the peer.
+    pub fn foreign(&self) -> u64 {
+        self.foreign
     }
 
     /// The local address the socket is bound to.
@@ -67,10 +77,19 @@ impl Transport for UdpTransport {
 
     fn try_recv(&mut self) -> io::Result<Option<Vec<u8>>> {
         let mut buf = [0u8; MAX_DATAGRAM];
-        match self.socket.recv_from(&mut buf) {
-            Ok((len, _from)) => Ok(Some(buf[..len].to_vec())),
-            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(None),
-            Err(e) => Err(e),
+        loop {
+            match self.socket.recv_from(&mut buf) {
+                Ok((len, from)) if from == self.peer => return Ok(Some(buf[..len].to_vec())),
+                // The CRC is not authentication, so anyone who can reach the
+                // port could inject frames. Only the peer's datagrams are kept.
+                Ok(_) => self.foreign += 1,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(None),
+                // Windows reports an earlier send to a closed port as a receive
+                // error on an unconnected socket. It says nothing about the
+                // datagrams waiting behind it, so carry on.
+                Err(e) if e.kind() == ErrorKind::ConnectionReset => {}
+                Err(e) => return Err(e),
+            }
         }
     }
 }

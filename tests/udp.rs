@@ -80,3 +80,15 @@ fn link_sequencing_works_over_udp() {
     );
     assert_eq!(b.stats().lost, 0);
 }
+
+#[test]
+fn datagrams_from_other_addresses_are_dropped() {
+    let mut a = UdpTransport::bind("127.0.0.1:0", "127.0.0.1:9".parse().unwrap()).unwrap();
+    let intruder = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    intruder
+        .send_to(b"injected", a.local_addr().unwrap())
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(a.try_recv().unwrap(), None);
+    assert_eq!(a.foreign(), 1);
+}
