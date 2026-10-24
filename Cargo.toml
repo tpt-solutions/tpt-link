@@ -35,3 +35,8 @@ socketcan = { version = "4", default-features = false, optional = true }
 [[example]]
 name = "schema_roundtrip"
 required-features = ["proto"]
+
+[[bin]]
+name = "tpt-link-cli"
+path = "src/bin/tpt-link-cli.rs"
+required-features = ["std"]
