@@ -5,7 +5,8 @@
 //! Apache-2.0). Enabled with the `serial` feature.
 //!
 //! The port is a byte stream, so the `Deframer` finds the frame boundaries.
-//! Reads use a short timeout so that `try_recv` never blocks for long.
+//! Reads use a short timeout (1 ms), so `try_recv` blocks for at most that long
+//! when the line is idle. It is not strictly non-blocking.
 
 use std::io::{self, ErrorKind};
 use std::time::{Duration, Instant};
@@ -67,6 +68,10 @@ impl SerialTransport {
 impl Transport for SerialTransport {
     type Error = io::Error;
 
+    /// Writes the whole frame. If the write fails part way (a write timeout, or
+    /// the device unplugged), a partial frame is already on the wire. The
+    /// peer's deframer discards it and resynchronises on the next frame, so the
+    /// caller only needs to send again.
     fn send(&mut self, frame: &[u8]) -> io::Result<()> {
         self.port.write_all(frame)
     }
@@ -78,13 +83,20 @@ impl Transport for SerialTransport {
             return Ok(Some(frame));
         }
 
+        // The read can wait up to READ_TIMEOUT, so the time is taken again
+        // afterwards. Otherwise the stall clock would lag by that long.
         let mut buf = [0u8; READ_CHUNK];
         match self.port.read(&mut buf) {
             Ok(0) => {}
-            Ok(n) => self.deframer.push_at(&buf[..n], now),
-            Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {}
+            Ok(n) => self.deframer.push_at(&buf[..n], self.now_us()),
+            // A signal interrupted the read. Nothing was lost; try again next call.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::TimedOut | ErrorKind::WouldBlock | ErrorKind::Interrupted
+                ) => {}
             Err(e) => return Err(e),
         }
-        Ok(self.deframer.next_frame_at(now))
+        Ok(self.deframer.next_frame_at(self.now_us()))
     }
 }
